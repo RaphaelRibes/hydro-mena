@@ -8,8 +8,8 @@
 //!   bench      benchmark the real pipeline (and GPU similarity with --features gpu)
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hydro_mena::pipeline::RunOptions;
-use hydro_mena::{io, pipeline, simulate};
+use mena::pipeline::RunOptions;
+use mena::{io, pipeline, simulate};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
                 alpha,
                 write_similarity,
                 write_artifacts: true,
-                rmt_cfg: hydro_mena::rmt::RmtConfig {
+                rmt_cfg: mena::rmt::RmtConfig {
                     giant: !no_giant,
                     trim_extremes: !no_trim,
                     min_spacings,
@@ -211,11 +211,11 @@ fn main() -> Result<()> {
         Cmd::Steps { abundance, out_dir, rmt_start } => {
             let (ab, otu_names, _sample_names) = io::read_abundance_csv(&abundance)?;
             std::fs::create_dir_all(&out_dir)?;
-            let z = hydro_mena::linalg::standardize_rows(&ab);
-            let s = hydro_mena::linalg::similarity_from_standardized(&z);
+            let z = mena::linalg::standardize_rows(&ab);
+            let s = mena::linalg::similarity_from_standardized(&z);
             let n = s.nrows();
             io::write_csv_matrix(&out_dir.join("similarity.csv"), &s, &otu_names, &otu_names, "OTU")?;
-            let rmt = hydro_mena::rmt::rmt_threshold(&s, rmt_start, (n / 10).max(10), 0.01, &hydro_mena::rmt::RmtConfig::default());
+            let rmt = mena::rmt::rmt_threshold(&s, rmt_start, (n / 10).max(10), 0.01, &mena::rmt::RmtConfig::default());
             println!(
                 "st={:.3} converged={} fallback={} kept={}/{}",
                 rmt.st,

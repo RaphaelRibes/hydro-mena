@@ -1,5 +1,5 @@
 [package]
-name = "hydro-mena"
+name = "mena"
 version = "0.1.0"
 edition = "2021"
 description = "RMT-based Molecular Ecological Network Analysis (Deng et al. 2012, BMC Bioinfo 13:113) with optional GPU (wgpu) compute"

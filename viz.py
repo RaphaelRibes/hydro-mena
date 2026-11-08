@@ -69,22 +69,18 @@ def stars(p: float) -> str:
 
 # ----------------------------------------------------------------- figures
 def _select_traits(r: pd.DataFrame, p: pd.DataFrame, max_cols: int = 12):
-    """Keep the heatmap readable on wide trait tables (ox has 74 traits).
+    """Pick which traits to display, by effect size ONLY.
 
-    Selecting columns for display only — the full matrix stays on disk in
-    fig5_r.csv / fig5_p.csv, which is the record.
+    Selecting columns by significance (as an earlier version did) is
+    cherry-picking: with ~1,500 tests, some columns are always "significant".
+    Rank by max |r| and ignore p entirely; p/q are still annotated in the cells.
     """
     cols = list(r.columns)
     if len(cols) <= max_cols:
         return r, p, False
-    sig = [c for c in cols if (p[c] < 0.05).any()]
-    if len(sig) > max_cols:
-        keep = sorted(sig, key=lambda c: -r[c].abs().max())[:max_cols]
-        sig = [c for c in cols if c in keep]
-    if not sig:
-        keep = sorted(cols, key=lambda c: -r[c].abs().max())[:15]
-        sig = [c for c in cols if c in keep]
-    return r[sig], p[sig], True
+    keep = sorted(cols, key=lambda c: -r[c].abs().max())[:max_cols]
+    keep = [c for c in cols if c in keep]
+    return r[keep], p[keep], True
 
 
 def fig5(run_dir: str, out: str) -> str:

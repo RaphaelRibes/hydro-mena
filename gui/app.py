@@ -109,7 +109,7 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0"))
         form = urllib.parse.parse_qs(self.rfile.read(n).decode())
         args = [
-            os.environ.get("MENA_BIN", os.path.join(os.getcwd(), "target/release/hydro-mena")),
+            os.environ.get("MENA_BIN", os.path.join(os.getcwd(), "target/release/mena")),
             "run",
             "--abundance", form.get("abundance", [""])[0],
             "--traits", form.get("traits", [""])[0],
