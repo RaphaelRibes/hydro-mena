@@ -32,6 +32,8 @@ pub struct ScanPoint {
     pub poisson: bool,
     /// Kolmogorov-Smirnov distance to the Poisson CDF (secondary diagnostic)
     pub ks: f64,
+    /// share of kept nodes inside the giant component the test was run on
+    pub giant_frac: f64,
 }
 
 /// Symmetric 0/1 adjacency from the similarity matrix at threshold `st`.
@@ -205,6 +207,43 @@ fn unfolded_spacings(lam_in: &[f64]) -> (Vec<f64>, Vec<f64>) {
     (d, xi)
 }
 
+/// Largest connected component of the binary graph over `keep`, as positions
+/// into `keep`, plus its fraction of all kept nodes.
+///
+/// A disconnected graph is Poisson-like for free (independent spectra
+/// superpose to Poisson), so testing a fragmented graph measures fragmentation,
+/// not modular structure. The spectral test is therefore run on the giant
+/// component and `giant_frac` is reported with every scan point.
+fn giant_component(a: &Mat, keep: &[usize]) -> (Vec<usize>, f64) {
+    let p = keep.len();
+    let mut comp = vec![usize::MAX; p];
+    let mut best: Vec<usize> = Vec::new();
+    let mut c = 0usize;
+    for s0 in 0..p {
+        if comp[s0] != usize::MAX {
+            continue;
+        }
+        comp[s0] = c;
+        let mut stack = vec![s0];
+        let mut members = vec![s0];
+        while let Some(u) = stack.pop() {
+            for v in 0..p {
+                if v != u && comp[v] == usize::MAX && a[(keep[u], keep[v])] > 0.0 {
+                    comp[v] = c;
+                    stack.push(v);
+                    members.push(v);
+                }
+            }
+        }
+        if members.len() > best.len() {
+            best = members;
+        }
+        c += 1;
+    }
+    let frac = if p > 0 { best.len() as f64 / p as f64 } else { 0.0 };
+    (best, frac)
+}
+
 /// Evaluate one candidate threshold: eigen-decompose the adjacency, unfold,
 /// run the Poisson GOF.
 fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint> {
@@ -214,20 +253,31 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
     if p < min_nodes.max(6) {
         return None;
     }
+    let (giant, giant_frac) = giant_component(&a, &keep);
+    if giant.len() < min_nodes.max(6) {
+        return None;
+    }
+    let g = giant.len();
     // Deng/Luo eigen-decompose the *thresholded similarity* matrix (weights
     // retained, below-threshold entries zeroed, diagonal 0) — see the 2025
     // repo's pretreating.py: `adjacency = matrix.abs(); adjacency[< st] = 0`.
-    // Binarising instead produces repeated 0/-1 eigenvalues that no amount of
-    // tie-collapsing fixes honestly.
-    let mut w = Mat::zeros((p, p));
-    for (x, &i) in keep.iter().enumerate() {
-        for (y, &j) in keep.iter().enumerate() {
-            if x != y && s[(i, j)] >= st {
-                w[(x, y)] = s[(i, j)];
+    let mut w = Mat::zeros((g, g));
+    for (x, &i) in giant.iter().enumerate() {
+        for (y, &j) in giant.iter().enumerate() {
+            if x != y && s[(keep[i], keep[j])] >= st {
+                w[(x, y)] = s[(keep[i], keep[j])];
             }
         }
     }
-    let (lam, _) = linalg::eigh(&w);
+    let (mut lam, _) = linalg::eigh(&w);
+    // The Perron eigenvalue of a weighted matrix is huge and isolated; fitting
+    // the integrated density across it makes the polynomial non-monotone (which
+    // my clipping then turned into zero spacings and blanket rejection).
+    // Unfold the bulk only.
+    if lam.len() > 10 {
+        lam.pop();
+        lam.remove(0);
+    }
     let (d, _) = unfolded_spacings(&lam);
     // A near-empty graph yields a handful of spacings and a trivial dof, which
     // used to "converge" the scan on a 31-node remnant. Require a spectrum large
@@ -236,6 +286,12 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
         return None;
     }
     let (chi2, dof, crit) = stats::poisson_gof(&d, alpha);
+    // dof < 2 = the spacings could not be resolved into enough bins for the
+    // test to mean anything. Report the point as non-estimable instead of
+    // letting chi2 ~ 0 masquerade as agreement with Poisson.
+    if dof < 2 || !chi2.is_finite() {
+        return None;
+    }
     let ks = stats::ks_poisson(&d);
     Some(ScanPoint {
         st,
@@ -246,6 +302,7 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
         crit,
         poisson: dof > 0 && chi2 <= crit,
         ks,
+        giant_frac,
     })
 }
 

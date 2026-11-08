@@ -40,6 +40,7 @@ pub struct RunReport {
     pub eigengene_var_explained: Vec<f64>,
     pub fig5_r: Vec<Vec<f64>>, // modules x traits
     pub fig5_p: Vec<Vec<f64>>,
+    pub fig5_q: Vec<Vec<f64>>,
     pub mantel: MantelReport,
     pub timing_s: Timing,
 }
@@ -256,6 +257,16 @@ pub fn run_pipeline(
     let eigengene_s = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
+    // BH-FDR over the whole module x trait family: starring raw p-values across
+    // ~1,480 tests (20 modules x 74 traits) is multiplicative cherry-picking.
+    let p_flat: Vec<f64> = eig.trait_p.iter().copied().collect();
+    let q_flat = crate::stats::bh_qvalues(&p_flat);
+    let fig5_q: Vec<Vec<f64>> = {
+        let cols = eig.trait_p.ncols();
+        (0..eig.trait_p.nrows())
+            .map(|b| (0..cols).map(|h| q_flat[b * cols + h]).collect())
+            .collect()
+    };
     let mantel = mantel_connectivity_vs_traits(&a, &zk, traits, opts.n_perm, opts.seed);
     let mantel_s = t.elapsed().as_secs_f64();
 
@@ -321,6 +332,7 @@ pub fn run_pipeline(
         eigengene_var_explained: eig.var_explained.clone(),
         fig5_r,
         fig5_p,
+        fig5_q,
         mantel: MantelReport {
             r: mantel.r,
             p: mantel.p,
@@ -397,6 +409,13 @@ fn write_artifacts(
     io::write_csv_matrix(&out.join("eigengenes.csv"), &eig.E, module_names, sample_names, "module")?;
     io::write_csv_matrix(&out.join("fig5_r.csv"), &eig.trait_r, module_names, trait_names, "module")?;
     io::write_csv_matrix(&out.join("fig5_p.csv"), &eig.trait_p, module_names, trait_names, "module")?;
+    {
+        let cols = eig.trait_p.ncols();
+        let flat: Vec<f64> = eig.trait_p.iter().copied().collect();
+        let q = crate::stats::bh_qvalues(&flat);
+        let qm = Mat::from_shape_fn((eig.trait_p.nrows(), cols), |(b, h)| q[b * cols + h]);
+        io::write_csv_matrix(&out.join("fig5_q.csv"), &qm, module_names, trait_names, "module")?;
+    }
 
     // edges (weight = |r| when the similarity matrix is available)
     {

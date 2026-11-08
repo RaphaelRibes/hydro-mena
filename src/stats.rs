@@ -83,8 +83,11 @@ pub fn poisson_gof(d: &[f64], alpha: f64) -> (f64, usize, f64) {
             chi2 += (o[k] - e[k]).powi(2) / e[k];
         }
     }
-    // -1 for the constraint sum(obs) = n, -1 for the estimated mean spacing
-    let dof = o.len().saturating_sub(2).max(1);
+    // -1 for the constraint sum(obs) = n, -1 for the estimated mean spacing.
+    // It must NOT be floored at 1: with a single merged bin there is no test to
+    // perform, and a fabricated dof=1 turns chi2~0 into a spurious "Poisson"
+    // verdict. dof=0 means "not estimable" and propagates as such.
+    let dof = o.len().saturating_sub(2);
     let crit = ChiSquared::new(dof as f64)
         .map(|c| c.inverse_cdf(1.0 - alpha))
         .unwrap_or(f64::NAN);
@@ -108,6 +111,27 @@ pub fn ks_poisson(d: &[f64]) -> f64 {
         dist = dist.max((hi - cdf).abs()).max((cdf - lo).abs());
     }
     dist
+}
+
+/// Benjamini-Hochberg q-values. NaN/undefined p-values are excluded from the
+/// family (never treated as 1.0): a degenerate test is not evidence of no effect.
+/// Returns q aligned to the input, NaN where the input p was NaN.
+pub fn bh_qvalues(p: &[f64]) -> Vec<f64> {
+    let mut idx: Vec<usize> = (0..p.len()).filter(|&i| p[i].is_finite()).collect();
+    let m = idx.len();
+    let mut q = vec![f64::NAN; p.len()];
+    if m == 0 {
+        return q;
+    }
+    idx.sort_by(|&a, &b| p[a].partial_cmp(&p[b]).unwrap());
+    let mut running = 1.0f64;
+    for rank in (1..=m).rev() {
+        let i = idx[rank - 1];
+        let val = (p[i] * m as f64 / rank as f64).min(1.0);
+        running = running.min(val);
+        q[i] = running;
+    }
+    q
 }
 
 pub fn mean(x: &[f64]) -> f64 {
@@ -227,6 +251,22 @@ mod tests {
         let flat = vec![1.0f64; 500];
         let (chi2f, _, critf) = poisson_gof(&flat, 0.01);
         assert!(chi2f > critf, "flat spacings must be rejected");
+    }
+
+    #[test]
+    fn bh_matches_known_example_and_is_monotone() {
+        // classic BH illustration; q must be >= p, monotone in rank, capped at 1
+        let p = [0.001, 0.008, 0.039, 0.041, 0.042, 0.06, 0.074, 0.205, 0.212, 0.9];
+        let q = bh_qvalues(&p);
+        for i in 0..p.len() {
+            assert!(q[i] >= p[i] - 1e-12, "q < p at {i}");
+            assert!(q[i] <= 1.0);
+        }
+        assert!((q[0] - 0.01).abs() < 1e-9, "q0={}", q[0]); // 0.001*10/1
+        // NaN p stays NaN and does not consume a rank
+        let q2 = bh_qvalues(&[0.01, f64::NAN, 0.04]);
+        assert!(q2[1].is_nan());
+        assert!((q2[2] - 0.05).abs() < 1e-9, "q2={}", q2[2]); // 0.04*2/2
     }
 
     #[test]

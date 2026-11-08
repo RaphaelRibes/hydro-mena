@@ -103,6 +103,15 @@ fn main() -> Result<()> {
             let d = simulate::simulate(otus, samples, modules, traits, background, noise, seed);
             io::write_abundance_csv(&out_dir.join("abundance.csv"), &d.abundance, &d.otu_names, &d.sample_names)?;
             io::write_traits_csv(&out_dir.join("traits.csv"), &d.traits, &d.sample_names, &d.trait_names)?;
+            // planted partition, so a recovered network can be scored against known truth
+            {
+                let mut w = csv::Writer::from_path(out_dir.join("planted.csv"))?;
+                w.write_record(["OTU", "planted_module"])?;
+                for (name, m) in d.otu_names.iter().zip(d.module_of.iter()) {
+                    w.write_record([name.clone(), format!("{}", m + 1)])?;
+                }
+                w.flush()?;
+            }
             println!(
                 "wrote {} ({} OTUs x {} samples) and traits.csv ({} traits) to {}",
                 out_dir.join("abundance.csv").display(),
