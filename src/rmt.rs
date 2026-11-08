@@ -173,11 +173,6 @@ fn polyval(coef: &[f64], x: f64) -> f64 {
 fn unfolded_spacings(lam_in: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let mut sorted: Vec<f64> = lam_in.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    // A 0/1 adjacency spectrum is massively degenerate (repeated -1 and 0
-    // eigenvalues). Those ties are an artefact of the unweighted graph, not
-    // level repulsion, and they turn the unfolded spacing into an exact zero.
-    // Collapse them before unfolding; the NNSD is defined on distinct levels.
-    sorted.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
     let lam_sorted: &[f64] = &sorted;
     let p = lam_sorted.len();
     if p < 6 {
@@ -219,13 +214,20 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
     if p < min_nodes.max(6) {
         return None;
     }
-    let mut sub = Mat::zeros((p, p));
+    // Deng/Luo eigen-decompose the *thresholded similarity* matrix (weights
+    // retained, below-threshold entries zeroed, diagonal 0) — see the 2025
+    // repo's pretreating.py: `adjacency = matrix.abs(); adjacency[< st] = 0`.
+    // Binarising instead produces repeated 0/-1 eigenvalues that no amount of
+    // tie-collapsing fixes honestly.
+    let mut w = Mat::zeros((p, p));
     for (x, &i) in keep.iter().enumerate() {
         for (y, &j) in keep.iter().enumerate() {
-            sub[(x, y)] = a[(i, j)];
+            if x != y && s[(i, j)] >= st {
+                w[(x, y)] = s[(i, j)];
+            }
         }
     }
-    let (lam, _) = linalg::eigh(&sub);
+    let (lam, _) = linalg::eigh(&w);
     let (d, _) = unfolded_spacings(&lam);
     // A near-empty graph yields a handful of spacings and a trivial dof, which
     // used to "converge" the scan on a 31-node remnant. Require a spectrum large
@@ -238,7 +240,7 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
     Some(ScanPoint {
         st,
         p,
-        edges: edges_of(&sub),
+        edges: edges_of(&w),
         chi2,
         dof,
         crit,
@@ -336,13 +338,15 @@ pub fn at_threshold(s: &Mat, st: f64) -> RmtResult {
     let mut spacings = Vec::new();
     if !kept.is_empty() {
         let p = kept.len();
-        let mut sub = Mat::zeros((p, p));
+        let mut w = Mat::zeros((p, p));
         for (x, &i) in kept.iter().enumerate() {
             for (y, &j) in kept.iter().enumerate() {
-                sub[(x, y)] = a[(i, j)];
+                if x != y && s[(i, j)] >= st {
+                    w[(x, y)] = s[(i, j)];
+                }
             }
         }
-        let (lam, _) = linalg::eigh(&sub);
+        let (lam, _) = linalg::eigh(&w);
         let (d, _) = unfolded_spacings(&lam);
         eigenvalues = lam;
         spacings = d;

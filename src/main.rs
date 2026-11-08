@@ -62,7 +62,7 @@ enum Cmd {
         #[arg(long, default_value = "0.30")]
         rmt_start: f64,
         /// Significance level of the Poisson GOF in the RMT scan
-        #[arg(long, default_value = "0.01")]
+        #[arg(long, default_value = "0.05")]
         alpha: f64,
         /// Also write the full n x n similarity matrix (large for many OTUs)
         #[arg(long)]
