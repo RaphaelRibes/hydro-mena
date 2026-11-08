@@ -145,7 +145,7 @@ impl Default for RunOptions {
             seed: 0,
             fixed_st: None,
             rmt_start: 0.30,
-            alpha: 0.05,
+            alpha: 0.01,
             write_similarity: false,
             write_artifacts: true,
             abundance_path: String::new(),
