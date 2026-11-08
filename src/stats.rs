@@ -266,7 +266,7 @@ mod tests {
         // NaN p stays NaN and does not consume a rank
         let q2 = bh_qvalues(&[0.01, f64::NAN, 0.04]);
         assert!(q2[1].is_nan());
-        assert!((q2[2] - 0.05).abs() < 1e-9, "q2={}", q2[2]); // 0.04*2/2
+        assert!((q2[2] - 0.04).abs() < 1e-9, "q2={}", q2[2]); // 0.04*2/2 = 0.04
     }
 
     #[test]
