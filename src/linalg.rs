@@ -5,8 +5,9 @@
 //! symmetric eigenproblem goes through a Householder + implicit-QR solver
 //! instead of the previous "find the largest off-diagonal element, rotate,
 //! repeat" Jacobi loop: that rescanned the whole matrix on every rotation
-//! (O(n^4) per decomposition) and was capped at 200 sweeps, so large matrices
-//! could also return an unconverged spectrum without any diagnostic.
+//! (O(n^4) per decomposition) and ran at most 200 rotations **in total**, so any
+//! matrix larger than roughly 20x20 came back essentially unconverged and said so
+//! nowhere.
 
 use ndarray::Array2;
 use rayon::prelude::*;

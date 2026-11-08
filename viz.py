@@ -68,16 +68,37 @@ def stars(p: float) -> str:
 
 
 # ----------------------------------------------------------------- figures
+def _select_traits(r: pd.DataFrame, p: pd.DataFrame, max_cols: int = 12):
+    """Keep the heatmap readable on wide trait tables (ox has 74 traits).
+
+    Selecting columns for display only — the full matrix stays on disk in
+    fig5_r.csv / fig5_p.csv, which is the record.
+    """
+    cols = list(r.columns)
+    if len(cols) <= max_cols:
+        return r, p, False
+    sig = [c for c in cols if (p[c] < 0.05).any()]
+    if len(sig) > max_cols:
+        keep = sorted(sig, key=lambda c: -r[c].abs().max())[:max_cols]
+        sig = [c for c in cols if c in keep]
+    if not sig:
+        keep = sorted(cols, key=lambda c: -r[c].abs().max())[:15]
+        sig = [c for c in cols if c in keep]
+    return r[sig], p[sig], True
+
+
 def fig5(run_dir: str, out: str) -> str:
     """Module eigengene x trait correlations, p annotated as in Deng Fig. 5."""
     r = pd.read_csv(os.path.join(run_dir, "fig5_r.csv"), index_col=0)
     p = pd.read_csv(os.path.join(run_dir, "fig5_p.csv"), index_col=0)
+    n_all = r.shape[1]
+    r, p, filtered = _select_traits(r, p)
     r.index = [str(i).replace("module_", "#") for i in r.index]
     p.index = r.index
     annot = np.array(
         [[f"{v:+.2f}\n{stars(q)}" for v, q in zip(rr, pp)] for rr, pp in zip(r.values, p.values)]
     )
-    fig, ax = plt.subplots(figsize=(max(6.0, 1.5 * r.shape[1] + 3.0), max(3.5, 0.62 * r.shape[0] + 2.0)))
+    fig, ax = plt.subplots(figsize=(min(17.0, max(6.0, 0.62 * r.shape[1] + 4.0)), max(3.5, 0.34 * r.shape[0] + 2.2)))
     im = ax.imshow(r.values, cmap="RdYlGn", vmin=-1, vmax=1, aspect="auto")
     ax.set_xticks(range(r.shape[1]), r.columns, rotation=30, ha="right")
     ax.set_yticks(range(r.shape[0]), r.index)
@@ -94,34 +115,35 @@ def fig5(run_dir: str, out: str) -> str:
     ax.tick_params(which="minor", length=0)
     cb = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
     cb.set_label("Pearson r")
-    ax.set_title("Module eigengenes vs environmental traits\n(* p<0.05, ** p<0.01, *** p<0.001)")
+    ax.set_title("Module eigengenes vs environmental traits"
+                 + (f"\nshowing {r.shape[1]} of {n_all} traits" if filtered else "")
+                 + "  (* p<0.05, ** p<0.01, *** p<0.001)")
     return save(fig, out)
 
 
-def _layout(n: int, edges: np.ndarray, iters: int = 220, seed: int = 7) -> np.ndarray:
-    """Deterministic Fruchterman-Reingold layout on a sparse edge list."""
-    rng = np.random.default_rng(seed)
-    pos = rng.normal(size=(n, 2))
-    if len(edges) == 0:
-        return pos
-    k = 1.0 / math.sqrt(n)
-    t = 0.12
-    for _ in range(iters):
-        disp = np.zeros_like(pos)
-        d = pos[:, None, :] - pos[None, :, :]
-        dist = np.linalg.norm(d, axis=2) + 1e-9
-        rep = (k * k / dist**2)[:, :, None] * d
-        np.fill_diagonal(dist, np.inf)
-        disp += rep.sum(axis=1) / n
-        i, j = edges[:, 0], edges[:, 1]
-        dv = pos[i] - pos[j]
-        dl = np.linalg.norm(dv, axis=1) + 1e-9
-        f = (dl / k)[:, None] * dv
-        np.add.at(disp, i, -f)
-        np.add.at(disp, j, f)
-        disp /= np.maximum(np.linalg.norm(disp, axis=1, keepdims=True), 1e-9)
-        pos += disp * t
-        t *= 0.985
+def _layout(nodes: pd.DataFrame, seed: int = 3) -> np.ndarray:
+    """Module-radial layout: one disc per module on a ring, members on a
+    golden-angle spiral inside it.
+
+    A force simulation at 800+ edges collapses into an unreadable hairball and
+    says nothing about community structure; placing modules explicitly shows the
+    partition (the point of the analysis) and keeps labels separable.
+    """
+    mods = list(dict.fromkeys(nodes["module"].tolist()))
+    k = max(1, len(mods))
+    index_of = {m: i for i, m in enumerate(mods)}
+    counts = nodes.groupby("module").size().to_dict()
+    pos = np.zeros((len(nodes), 2))
+    for i, m in enumerate(nodes["module"].tolist()):
+        b = index_of[m]
+        ang = 2 * np.pi * b / k
+        ring = 1.0 + 0.30 * np.sqrt(counts[m]) / 3.0
+        cx, cy = ring * np.cos(ang), ring * np.sin(ang)
+        n_m = max(1, counts[m])
+        j = sum(1 for x in nodes["module"].tolist()[:i] if x == m)
+        r = 0.34 * np.sqrt((j + 0.5) / n_m)
+        th = j * 2.399963 + b
+        pos[i] = (cx + r * np.cos(th), cy + r * np.sin(th))
     return pos
 
 
@@ -138,23 +160,24 @@ def network(run_dir: str, out: str, max_nodes: int = 1200) -> str:
         edges = edges[edges["source"].isin(keep) & edges["target"].isin(keep)]
         idx = {name: i for i, name in enumerate(nodes["OTU"])}
     e = np.array([[idx[a], idx[b]] for a, b in zip(edges["source"], edges["target"]) if a in idx and b in idx])
-    pos = _layout(len(nodes), e)
+    pos = _layout(nodes)
     fig, ax = plt.subplots(figsize=(9, 9))
     if len(e):
         segments = [(pos[a], pos[b]) for a, b in e]
-        ax.add_collection(LineCollection(segments, colors="#cccccc", linewidths=0.5, zorder=1))
+        ax.add_collection(LineCollection(segments, colors="#c8ccd4", linewidths=0.28, alpha=0.7, zorder=1))
     mods = nodes["module"].to_numpy()
-    size = 12 + 4.0 * nodes["degree"].to_numpy()
+    size = 6 + 2.2 * nodes["degree"].to_numpy()
     ax.scatter(pos[:, 0], pos[:, 1], c=mods, cmap=MODULE_CMAP, s=size, edgecolors="white", linewidths=0.4, zorder=2)
-    hubs = nodes.nlargest(min(8, len(nodes)), "degree")
+    hubs = nodes.nlargest(min(5, len(nodes)), "degree")
     for _, row in hubs.iterrows():
         i = idx[row["OTU"]]
         ax.annotate(row["OTU"], pos[i], fontsize=6, xytext=(4, 4), textcoords="offset points")
     ax.set_title(
         f"Co-occurrence network — {len(nodes)} nodes, {len(e)} edges, {nodes['module'].nunique()} modules\n"
-        "colour = module, size = degree (top-degree OTUs labelled)"
+        "one disc per module, size = degree (top-degree OTUs labelled)"
     )
     ax.set_axis_off()
+    ax.margins(0.06)
     return save(fig, out)
 
 
