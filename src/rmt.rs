@@ -19,6 +19,27 @@ use crate::linalg::{self, Mat};
 use crate::stats;
 use rayon::prelude::*;
 
+/// Every post-hoc choice in the spectral test, as a toggle. These were
+/// introduced while looking at real-data output, so each must be ablable: a
+/// "not estimable" verdict is only meaningful once we know which guard caused it.
+#[derive(Clone, Debug)]
+pub struct RmtConfig {
+    /// restrict the spectrum to the largest connected component
+    pub giant: bool,
+    /// drop the Perron eigenvalue (and the lowest) before unfolding
+    pub trim_extremes: bool,
+    /// minimum spacing count for the GOF to be attempted
+    pub min_spacings: usize,
+    /// minimum dof for a point to count as estimable
+    pub min_dof: usize,
+}
+
+impl Default for RmtConfig {
+    fn default() -> Self {
+        Self { giant: true, trim_extremes: true, min_spacings: 20, min_dof: 2 }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ScanPoint {
     pub st: f64,
@@ -246,14 +267,18 @@ fn giant_component(a: &Mat, keep: &[usize]) -> (Vec<usize>, f64) {
 
 /// Evaluate one candidate threshold: eigen-decompose the adjacency, unfold,
 /// run the Poisson GOF.
-fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint> {
+fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> Option<ScanPoint> {
     let a = adjacency(s, st);
     let keep = kept_nodes(&a);
     let p = keep.len();
     if p < min_nodes.max(6) {
         return None;
     }
-    let (giant, giant_frac) = giant_component(&a, &keep);
+    let (giant, giant_frac) = if cfg.giant {
+        giant_component(&a, &keep)
+    } else {
+        ((0..keep.len()).collect::<Vec<usize>>(), 1.0)
+    };
     if giant.len() < min_nodes.max(6) {
         return None;
     }
@@ -274,7 +299,7 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
     // the integrated density across it makes the polynomial non-monotone (which
     // my clipping then turned into zero spacings and blanket rejection).
     // Unfold the bulk only.
-    if lam.len() > 10 {
+    if cfg.trim_extremes && lam.len() > 10 {
         lam.pop();
         lam.remove(0);
     }
@@ -282,14 +307,14 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
     // A near-empty graph yields a handful of spacings and a trivial dof, which
     // used to "converge" the scan on a 31-node remnant. Require a spectrum large
     // enough for the GOF to mean anything.
-    if d.len() < 20 {
+    if d.len() < cfg.min_spacings {
         return None;
     }
     let (chi2, dof, crit) = stats::poisson_gof(&d, alpha);
     // dof < 2 = the spacings could not be resolved into enough bins for the
     // test to mean anything. Report the point as non-estimable instead of
     // letting chi2 ~ 0 masquerade as agreement with Poisson.
-    if dof < 2 || !chi2.is_finite() {
+    if dof < cfg.min_dof || !chi2.is_finite() {
         return None;
     }
     let ks = stats::ks_poisson(&d);
@@ -306,10 +331,10 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64) -> Option<ScanPoint>
     })
 }
 
-fn scan(s: &Mat, sts: &[f64], min_nodes: usize, alpha: f64) -> Vec<ScanPoint> {
+fn scan(s: &Mat, sts: &[f64], min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> Vec<ScanPoint> {
     let mut out: Vec<ScanPoint> = sts
         .par_iter()
-        .filter_map(|&st| evaluate(s, st, min_nodes, alpha))
+        .filter_map(|&st| evaluate(s, st, min_nodes, alpha, cfg))
         .collect();
     out.sort_by(|a, b| a.st.partial_cmp(&b.st).unwrap());
     out
@@ -333,14 +358,14 @@ pub struct RmtResult {
 /// RMT threshold: coarse scan by 0.05 from `st0`, then a 0.01 refine inside the
 /// accepting decade. When nothing is accepted the smallest chi^2/crit ratio is
 /// used and flagged `fallback` — the caller must report that, not hide it.
-pub fn rmt_threshold(s: &Mat, st0: f64, min_nodes: usize, alpha: f64) -> RmtResult {
+pub fn rmt_threshold(s: &Mat, st0: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> RmtResult {
     let mut coarse: Vec<f64> = Vec::new();
     let mut st = st0.max(0.01);
     while st <= 0.95 + 1e-9 {
         coarse.push((st * 1000.0).round() / 1000.0);
         st += 0.05;
     }
-    let log_coarse = scan(s, &coarse, min_nodes, alpha);
+    let log_coarse = scan(s, &coarse, min_nodes, alpha, cfg);
 
     let accepted = log_coarse.iter().find(|p| p.poisson).map(|p| p.st);
     let (st_final, converged, fallback, log) = match accepted {
@@ -352,7 +377,7 @@ pub fn rmt_threshold(s: &Mat, st0: f64, min_nodes: usize, alpha: f64) -> RmtResu
                 fine.push((v * 1000.0).round() / 1000.0);
                 v += 0.01;
             }
-            let mut log_fine = scan(s, &fine, min_nodes, alpha);
+            let mut log_fine = scan(s, &fine, min_nodes, alpha, cfg);
             let best = log_fine
                 .iter()
                 .find(|p| p.poisson)

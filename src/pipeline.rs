@@ -131,6 +131,8 @@ pub struct RunOptions {
     pub write_similarity: bool,
     /// write the per-run CSVs (disabled for benchmarking)
     pub write_artifacts: bool,
+    /// spectral-test toggles (ablated in the B1 study)
+    pub rmt_cfg: crate::rmt::RmtConfig,
     /// provenance labels recorded in report.json
     pub abundance_path: String,
     pub traits_path: String,
@@ -148,6 +150,7 @@ impl Default for RunOptions {
             alpha: 0.01,
             write_similarity: false,
             write_artifacts: true,
+            rmt_cfg: crate::rmt::RmtConfig::default(),
             abundance_path: String::new(),
             traits_path: String::new(),
         }
@@ -211,7 +214,7 @@ pub fn run_pipeline(
     let min_nodes = (abundance.nrows() / 10).max(10);
     let rmt = match opts.fixed_st {
         Some(st) => crate::rmt::at_threshold(&s, st),
-        None => rmt_threshold(&s, opts.rmt_start, min_nodes, opts.alpha),
+        None => rmt_threshold(&s, opts.rmt_start, min_nodes, opts.alpha, &opts.rmt_cfg),
     };
     let rmt_s = t.elapsed().as_secs_f64();
     eprintln!(

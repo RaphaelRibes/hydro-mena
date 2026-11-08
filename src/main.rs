@@ -67,6 +67,18 @@ enum Cmd {
         /// Also write the full n x n similarity matrix (large for many OTUs)
         #[arg(long)]
         write_similarity: bool,
+        /// ablation: do NOT restrict the spectrum to the giant component
+        #[arg(long)]
+        no_giant: bool,
+        /// ablation: do NOT trim the extreme (Perron) eigenvalues
+        #[arg(long)]
+        no_trim: bool,
+        /// ablation: minimum spacing count before the GOF is attempted
+        #[arg(long, default_value = "20")]
+        min_spacings: usize,
+        /// ablation: minimum dof for a point to count as estimable
+        #[arg(long, default_value = "2")]
+        min_dof: usize,
     },
     /// Similarity + RMT scan diagnostics only
     Steps {
@@ -131,6 +143,10 @@ fn main() -> Result<()> {
             rmt_start,
             alpha,
             write_similarity,
+            no_giant,
+            no_trim,
+            min_spacings,
+            min_dof,
         } => {
             let (ab, otu_names, sample_names) = io::read_abundance_csv(&abundance)?;
             let (tr, _sn, trait_names) = io::read_traits_csv(&traits, &sample_names)?;
@@ -144,6 +160,12 @@ fn main() -> Result<()> {
                 alpha,
                 write_similarity,
                 write_artifacts: true,
+                rmt_cfg: hydro_mena::rmt::RmtConfig {
+                    giant: !no_giant,
+                    trim_extremes: !no_trim,
+                    min_spacings,
+                    min_dof,
+                },
                 abundance_path: abundance.display().to_string(),
                 traits_path: traits.display().to_string(),
             };
@@ -193,7 +215,7 @@ fn main() -> Result<()> {
             let s = hydro_mena::linalg::similarity_from_standardized(&z);
             let n = s.nrows();
             io::write_csv_matrix(&out_dir.join("similarity.csv"), &s, &otu_names, &otu_names, "OTU")?;
-            let rmt = hydro_mena::rmt::rmt_threshold(&s, rmt_start, (n / 10).max(10), 0.01);
+            let rmt = hydro_mena::rmt::rmt_threshold(&s, rmt_start, (n / 10).max(10), 0.01, &hydro_mena::rmt::RmtConfig::default());
             println!(
                 "st={:.3} converged={} fallback={} kept={}/{}",
                 rmt.st,

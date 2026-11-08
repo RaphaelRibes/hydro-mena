@@ -250,6 +250,39 @@ criterion walks upward. The criterion optimises spectral randomness, not
 community recovery. At noise 0.50 almost nothing is recoverable at any
 threshold, so the threshold governs sparsity, not validity.
 
+== Ablation: which guard produces "not estimable"?
+
+Four post-hoc guards were introduced while reading output (giant-component
+restriction, Perron trimming, a minimum dof and a minimum spacing count). Each
+was toggled independently on the `ox` condition.
+
+#table(
+  columns: (auto, auto, auto, auto, auto),
+  stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
+  [*configuration*], [*points*], [*st*], [*accepted*], [*kept*],
+  [baseline (all guards)], [0], [0.950], [no], [59],
+  [no giant component], [0], [0.950], [no], [59],
+  [no Perron trim], [0], [0.950], [no], [59],
+  [min dof = 0], [1], [0.750], [no], [123],
+  [min spacings = 6], [0], [0.950], [no], [59],
+  [all guards off], [0], [0.950], [no], [59],
+)
+
+Two conclusions, and they separate cleanly:
+
++ *The scientific verdict is robust.* No configuration accepts a threshold, on
+  any of the three conditions. The single point that survives when the dof guard
+  is removed (st = 0.75) fails the goodness-of-fit anyway.
++ *The reported point count is not robust.* "Zero estimable points" is produced
+  by the dof guard; without it, one point appears. So the phrase "not
+  estimable" should be read as "no threshold passes", not "no statistic could be
+  computed".
+
+Disabling the giant-component and Perron guards simultaneously empties the
+spacing set entirely, which means those two choices are load-bearing for
+producing a statistic at all on this data. That is a limitation to state, not a
+defect to hide: the unfolding is fragile at $n approx 170$ with 12 to 36 samples.
+
 = Results on the real data (exploratory)
 
 Fixed threshold 0.52 for comparability with the 2025 work, 999 permutations.
