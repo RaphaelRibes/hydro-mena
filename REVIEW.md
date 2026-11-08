@@ -1,5 +1,17 @@
 # hydro-mena — review, fixes and additions (2026-11-08)
 
+> **Correction (applied after the first pass).** `network::modularity` was
+> mathematically wrong in both the original code and my first rewrite: it
+> summed `1 - k_i k_j/2E` over **existing edges only**, omitting the
+> configuration-model term for non-edges, which returns `1/n` instead of `0`
+> for a complete graph in one community. It now uses the aggregate form
+> `Q = Σ_c [L_c/(2E) − (d_c/2E)²]`, with known-answer tests (complete graph → 0,
+> two disjoint triangles → 0.5). Every modularity figure in this document has
+> been recomputed; the §2 comparison table and the `--st 0.52` values below
+> supersede the first-pass numbers. The corrected figures are **lower** than
+> first reported (ox 0.650, not 0.705), which strengthens rather than weakens
+> the "the RMT stage was broken" conclusion.
+
 Scope: the `hydro-mena` Rust CLI (`~/hermes_scratch/hydro-mena`), the vault that
 documents it (`hydro-mena-vault`), and the processes that produce its numbers.
 Everything below is anchored to a file and a reproduced run.
@@ -20,15 +32,21 @@ therefore accepted the *first* threshold it tried. With `st0 = 0.01` (changed in
 
 Reproduced on 200 simulated OTUs, default `run`:
 
-| | before | after |
+| | before (rank unfolding) | after (corrected GOF, current build) |
 |---|---|---|
-| st | 0.010 | 0.930 |
-| nodes / edges | 200 / 19 500 (complete) | 31 / 31 |
-| avg degree | 195.0 | 2.00 |
-| modularity M | 0.009 | 0.775 |
-| γ (power law) | **−42.4** | 0.86 |
-| roles | 200 × "connector" | 31 × "peripheral" |
-| GD | 1.02 | 2.36 (8 components) |
+| st | 0.010 | 0.890 |
+| nodes / edges | 200 / 19 500 (complete) | 75 / 105 |
+| avg degree | 195.0 | 2.8 |
+| modularity M | 0.009 | 0.683 |
+| γ (power law) | **−42.4** | 1.09 |
+| roles | all "connector" | mixed |
+
+The corrected scan is **not yet stable** across small changes to degeneracy
+handling: an earlier build with a different tie tolerance landed at st=0.93 on
+31 nodes, and one variant kept 21 nodes with 15 edges. A threshold chosen on a
+20-node remnant is not a scientific result (see §6.1). What *is* established is
+the negative claim: the old statistic was identically zero and accepted any
+graph, including the complete one.
 
 A negative γ and 100 % connectors are the tell: every downstream stage was
 reading a saturated graph. This is why the 2025 repo's author hardcoded 0.52 and
@@ -55,14 +73,22 @@ The fallback picks the point with the smallest χ²/critical ratio. Against the
 2025 repo's reference network (`adjacency_matrix_ox.csv`,
 `data/network_indexes_ox.json`):
 
-| | repo | this run (fallback st=0.50) |
-|---|---|---|
-| modularity | 0.685 | 0.658 |
-| avg clustering | 0.618 | 0.637 |
-| GD | 3.80 | 3.80 |
+| | repo | ours @ st=0.52 (fixed) | ours (RMT scan) |
+|---|---|---|---|
+| threshold | 0.52 | 0.52 | 0.700 (converged) |
+| nodes / edges | 173 / 910 | 166 / 836 | 140 / 361 |
+| modularity | 0.685 | 0.650 | 0.845 |
+| avg clustering | 0.618 | 0.640 | — |
+| GD | 3.80 | 3.77 | — |
 
-The validated `--st 0.52` path still reproduces the earlier numbers
-(n=166, E=836, M=0.705).
+With modularity corrected, ours is now **systematically below** the reference on
+the fixed-threshold path (0.650 vs 0.685), where the first pass reported 0.705
+and a near-match. The reference uses networkx, whose modularity is the correct
+aggregate form, so this comparison is now apples-to-apples and the gap is real
+(different community algorithm: greedy Louvain phase-1 here vs their detector).
+
+The unpinned RMT scan converges at st=0.70 and returns a much sparser graph
+(361 edges), so it is **not** comparable to the repo's fixed-0.52 network.
 
 ## 3. Other defects found
 
