@@ -1,0 +1,29 @@
+[workspace]
+name = "hydro-mena"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+rust = "*"
+matplotlib = "*"
+seaborn = "*"
+pandas = "*"
+numpy = "*"
+
+[feature.gpu.dependencies]
+cuda-version = "12.*"
+
+[pypi-dependencies]
+# none; python side only does plotting (matplotlib/seaborn from conda above)
+
+[tasks]
+build = "cargo build --release"
+run = "cargo run --release --"
+bench = "cargo run --release -- bench --all"
+sim = "cargo run --release -- simulate"
+pipeline = "cargo run --release -- run --all"
+
+[environments]
+default = { features = [], solve-group = "default" }
+gpu = { features = ["gpu"], solve-group = "default" }

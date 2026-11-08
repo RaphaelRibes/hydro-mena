@@ -1,0 +1,22 @@
+# build artefacts
+/target/
+/.pixi/
+/.venv/
+
+# --- derived run outputs (regenerable; kept out of history) ---
+/real/
+/benches*/
+/demo*/
+/out*/
+*.tar.gz
+*.png
+*.svg
+
+# --- python ---
+__pycache__/
+*.pyc
+
+# --- editor / OS ---
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,108 @@
+//! CSV/JSON I/O for abundance tables, trait tables and result artifacts.
+use crate::linalg::Mat;
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::fs;
+use std::path::Path;
+
+pub fn write_abundance_csv(path: &Path, m: &Mat, row_names: &[String], col_names: &[String]) -> Result<()> {
+    let mut w = csv::Writer::from_path(path)?;
+    w.write_record(std::iter::once("OTU".to_string()).chain(col_names.iter().cloned()))?;
+    for i in 0..m.nrows() {
+        let mut rec = vec![row_names[i].clone()];
+        for j in 0..m.ncols() {
+            rec.push(format!("{:.10}", m[(i, j)]));
+        }
+        w.write_record(rec)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+pub fn read_abundance_csv(path: &Path) -> Result<(Mat, Vec<String>, Vec<String>)> {
+    let mut rdr = csv::Reader::from_path(path)?;
+    let header = rdr.headers()?.clone();
+    let col_names: Vec<String> = header.iter().skip(1).map(|s| s.to_string()).collect();
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut row_names = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        row_names.push(rec[0].to_string());
+        let mut row = Vec::with_capacity(col_names.len());
+        for j in 1..rec.len() {
+            row.push(rec[j].parse::<f64>().context("non-numeric abundance")?);
+        }
+        rows.push(row);
+    }
+    let n = rows.len();
+    let m = col_names.len();
+    let data = Mat::from_shape_fn((n, m), |(i, j)| rows[i][j]);
+    Ok((data, row_names, col_names))
+}
+
+pub fn write_traits_csv(path: &Path, t: &Mat, sample_names: &[String], trait_names: &[String]) -> Result<()> {
+    let mut w = csv::Writer::from_path(path)?;
+    w.write_record(std::iter::once("sample".to_string()).chain(trait_names.iter().cloned()))?;
+    for i in 0..t.nrows() {
+        let mut rec = vec![sample_names[i].clone()];
+        for j in 0..t.ncols() {
+            rec.push(format!("{:.10}", t[(i, j)]));
+        }
+        w.write_record(rec)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+pub fn read_traits_csv(path: &Path, samples: &[String]) -> Result<(Mat, Vec<String>, Vec<String>)> {
+    let mut rdr = csv::Reader::from_path(path)?;
+    let header = rdr.headers()?.clone();
+    let trait_names: Vec<String> = header.iter().skip(1).map(|s| s.to_string()).collect();
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut names = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        let id = rec[0].to_string();
+        if !samples.contains(&id) {
+            continue;
+        }
+        names.push(id);
+        let mut row = Vec::with_capacity(trait_names.len());
+        for j in 1..rec.len() {
+            row.push(rec[j].parse::<f64>().context("non-numeric trait")?);
+        }
+        rows.push(row);
+    }
+    // align to sample order
+    let mut aligned: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
+    let mut aligned_names = Vec::with_capacity(samples.len());
+    for s in samples {
+        if let Some(pos) = names.iter().position(|x| x == s) {
+            aligned.push(rows[pos].clone());
+            aligned_names.push(s.clone());
+        }
+    }
+    let n = aligned.len();
+    let m = trait_names.len();
+    let data = Mat::from_shape_fn((n, m), |(i, j)| aligned[i][j]);
+    Ok((data, aligned_names, trait_names))
+}
+
+pub fn write_json<T: Serialize>(path: &Path, obj: &T) -> Result<()> {
+    let s = serde_json::to_string_pretty(obj)?;
+    fs::write(path, s).with_context(|| format!("write {}", path.display()))
+}
+
+pub fn write_csv_matrix(path: &Path, m: &Mat, row_names: &[String], col_names: &[String], first_col: &str) -> Result<()> {
+    let mut w = csv::Writer::from_path(path)?;
+    w.write_record(std::iter::once(first_col.to_string()).chain(col_names.iter().cloned()))?;
+    for i in 0..m.nrows() {
+        let mut rec = vec![row_names[i].clone()];
+        for j in 0..m.ncols() {
+            rec.push(format!("{:.8}", m[(i, j)]));
+        }
+        w.write_record(rec)?;
+    }
+    w.flush()?;
+    Ok(())
+}
