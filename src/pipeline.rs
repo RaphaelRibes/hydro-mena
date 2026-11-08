@@ -1,14 +1,30 @@
 //! End-to-end pipeline orchestration + benchmark harness.
-use crate::eigengene::{eigengenes, EigengeneResult};
+//!
+//! Every stage writes a CSV a plotting layer or a GUI can read directly:
+//!
+//! | file | content |
+//! |---|---|
+//! | `report.json` | all scalars + timings (single source of truth) |
+//! | `similarity.csv` | S = abs(r), n x n (only with `--write-similarity`) |
+//! | `adjacency.csv` | thresholded 0/1 graph on the kept nodes |
+//! | `edges.csv` | `source,target,weight` for network plots |
+//! | `nodes.csv` | per-OTU module, role, zi, Pi, degree, MM, strongest trait |
+//! | `rmt_scan.csv` | one row per scanned threshold (chi2, dof, crit, KS) |
+//! | `spectrum.csv` | eigenvalues + unfolded spacings of the kept graph |
+//! | `degree_dist.csv` | degree distribution for the scale-free fit |
+//! | `modules.csv` | module size + variance explained |
+//! | `eigengenes.csv` | E_b(sample) |
+//! | `fig5_r.csv`, `fig5_p.csv` | module x trait correlations and p-values |
+use crate::eigengene::{eigengenes, trait_significance};
 use crate::io;
 use crate::linalg::{self, Mat};
-use crate::modules::{analyze_modules, ModuleAnalysis};
+use crate::modules::{analyze_modules_with, ModuleAnalysis};
 use crate::network::{self, Topology};
 use crate::rmt::{rmt_threshold, RmtResult};
 use crate::traits::mantel_connectivity_vs_traits;
 use anyhow::Result;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Serialize)]
@@ -17,30 +33,49 @@ pub struct RunReport {
     pub n_samples: usize,
     pub n_traits: usize,
     pub gpu_used: bool,
+    pub input: InputMeta,
     pub rmt: RmtReport,
     pub topology: TopoReport,
     pub modules: ModuleReport,
     pub eigengene_var_explained: Vec<f64>,
-    pub fig5_r: Vec<Vec<f64>>,   // modules x traits
+    pub fig5_r: Vec<Vec<f64>>, // modules x traits
     pub fig5_p: Vec<Vec<f64>>,
     pub mantel: MantelReport,
     pub timing_s: Timing,
 }
 
 #[derive(Serialize)]
+pub struct InputMeta {
+    pub abundance: String,
+    pub traits: String,
+    pub seed: u64,
+    pub permutations: usize,
+    pub fixed_threshold: Option<f64>,
+}
+
+#[derive(Serialize)]
 pub struct RmtReport {
     pub st: f64,
     pub converged: bool,
+    /// no threshold passed the GOF; `st` is a diagnostic fallback
+    pub fallback: bool,
+    pub alpha: f64,
     pub n_points: usize,
-    pub scan: Vec<(f64, usize, f64, bool)>,
+    pub n_kept: usize,
+    pub edges: usize,
+    pub scan: Vec<crate::rmt::ScanPoint>,
 }
 
 #[derive(Serialize)]
 pub struct TopoReport {
     pub n: usize,
     pub edges: usize,
+    pub density: f64,
     pub avg_k: f64,
     pub gd: f64,
+    pub connected_frac: f64,
+    pub n_components: usize,
+    pub giant_frac: f64,
     pub avg_cc: f64,
     pub modularity: f64,
     pub n_modules: usize,
@@ -62,6 +97,7 @@ pub struct MantelReport {
     pub r: f64,
     pub p: f64,
     pub n_perm: usize,
+    pub r_null_mean: f64,
 }
 
 #[derive(Serialize)]
@@ -73,24 +109,77 @@ pub struct Timing {
     pub modules_s: f64,
     pub eigengene_s: f64,
     pub mantel_s: f64,
+    pub export_s: f64,
     pub total_s: f64,
+}
+
+/// Everything the caller can tune, so `run_pipeline` keeps a stable arity.
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    pub out_dir: PathBuf,
+    pub use_gpu: bool,
+    pub n_perm: usize,
+    pub seed: u64,
+    /// skip the RMT scan and use this similarity threshold
+    pub fixed_st: Option<f64>,
+    /// lowest similarity threshold the RMT scan considers
+    pub rmt_start: f64,
+    /// significance level of the Poisson GOF
+    pub alpha: f64,
+    /// write the full n x n similarity matrix (can be huge)
+    pub write_similarity: bool,
+    /// write the per-run CSVs (disabled for benchmarking)
+    pub write_artifacts: bool,
+    /// provenance labels recorded in report.json
+    pub abundance_path: String,
+    pub traits_path: String,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            out_dir: PathBuf::from("out"),
+            use_gpu: false,
+            n_perm: 999,
+            seed: 0,
+            fixed_st: None,
+            rmt_start: 0.30,
+            alpha: 0.01,
+            write_similarity: false,
+            write_artifacts: true,
+            abundance_path: String::new(),
+            traits_path: String::new(),
+        }
+    }
 }
 
 pub struct RunArtifacts {
     pub report: RunReport,
-    pub S: Mat,
-    pub A: Mat,
-    pub kept: Vec<usize>,
+    pub adjacency: Mat,
     pub kept_names: Vec<String>,
-    pub E: Mat,
-    pub trait_r: Mat,
-    pub trait_p: Mat,
-    pub trait_names: Vec<String>,
-    pub sample_names: Vec<String>,
-    pub eig: EigengeneResult,
-    pub mod_analysis: ModuleAnalysis,
-    pub topo: Topology,
-    pub rmt: RmtResult,
+}
+
+/// Similarity matrix on GPU when asked and available, otherwise rayon CPU.
+/// The GPU result is *used*; the previous version discarded it and recomputed
+/// the whole matrix on the CPU ("[gpu] similarity computed" followed by a
+/// silent CPU pass), so `--gpu` reported `gpu_used=true` while burning both.
+fn similarity(z: &Mat, use_gpu: bool) -> (Mat, bool) {
+    #[cfg(feature = "gpu")]
+    {
+        if use_gpu {
+            match crate::gpu::similarity_gpu(z) {
+                Ok(s) => return (s, true),
+                Err(e) => eprintln!("[gpu] similarity failed ({e}); falling back to CPU"),
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        if use_gpu {
+            eprintln!("[gpu] binary built without the gpu feature; using CPU");
+        }
+    }
+    (linalg::similarity_from_standardized(z), false)
 }
 
 pub fn run_pipeline(
@@ -99,175 +188,123 @@ pub fn run_pipeline(
     sample_names: &[String],
     traits: &Mat,
     trait_names: &[String],
-    out_dir: &Path,
-    use_gpu: bool,
-    n_perm: usize,
-    seed: u64,
-    fixed_st: Option<f64>,
+    opts: &RunOptions,
 ) -> Result<RunArtifacts> {
-    std::fs::create_dir_all(out_dir)?;
+    if opts.write_artifacts {
+        std::fs::create_dir_all(&opts.out_dir)?;
+    }
     let t0 = Instant::now();
+
     let t = Instant::now();
     let z = linalg::standardize_rows(abundance);
     let standardize_s = t.elapsed().as_secs_f64();
 
-    // similarity: GPU if requested+available, else CPU (rayon)
     let t = Instant::now();
-    let gpu_used = use_gpu && {
-        #[cfg(feature = "gpu")]
-        {
-            match crate::gpu::similarity_gpu(&z) {
-                Ok(S) => {
-                    eprintln!("[gpu] similarity computed on GPU in {:.3}s", t.elapsed().as_secs_f64());
-                    std::fs::write(out_dir.join("S.csv"), csv_of(&S, otu_names, otu_names))?;
-                    return_continue(S)
-                }
-                Err(e) => {
-                    eprintln!("[gpu] similarity failed ({e}); falling back to CPU");
-                    false_marker()
-                }
-            }
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            eprintln!("[gpu] binary built without gpu feature; using CPU");
-            false_marker()
-        }
-    };
-    let S = if gpu_used {
-        // recompute path handled above; unreachable in practice
-        let R = linalg::correlation_matrix(&z);
-        let mut S = Mat::zeros((R.nrows(), R.ncols()));
-        for i in 0..R.nrows() {
-            for j in 0..R.ncols() {
-                S[(i, j)] = R[(i, j)].abs();
-            }
-            S[(i, i)] = 0.0;
-        }
-        S
-    } else {
-        let R = linalg::correlation_matrix(&z);
-        let mut S = Mat::zeros((R.nrows(), R.ncols()));
-        for i in 0..R.nrows() {
-            for j in 0..R.ncols() {
-                S[(i, j)] = R[(i, j)].abs();
-            }
-            S[(i, i)] = 0.0;
-        }
-        S
-    };
+    let (s, gpu_used) = similarity(&z, opts.use_gpu);
     let similarity_s = t.elapsed().as_secs_f64();
-    io::write_csv_matrix(&out_dir.join("similarity.csv"), &S, otu_names, otu_names, "OTU")?;
+    if opts.write_artifacts && opts.write_similarity {
+        io::write_csv_matrix(&opts.out_dir.join("similarity.csv"), &s, otu_names, otu_names, "OTU")?;
+    }
 
     let t = Instant::now();
     let min_nodes = (abundance.nrows() / 10).max(10);
-    let rmt = match fixed_st {
-        Some(st) => {
-            let A = {
-                let n = S.nrows();
-                let mut A = Mat::zeros((n, n));
-                for i in 0..n {
-                    for j in 0..n {
-                        if i != j && S[(i, j)] >= st {
-                            A[(i, j)] = 1.0;
-                        }
-                    }
-                }
-                A
-            };
-            let kept: Vec<usize> = (0..A.nrows()).filter(|&i| (0..A.ncols()).any(|j| A[(i, j)] > 0.0)).collect();
-            RmtResult {
-                st,
-                converged: false,
-                log: vec![],
-                adjacency: A,
-                kept,
-            }
-        }
-        None => rmt_threshold(&S, 0.01, min_nodes),
+    let rmt = match opts.fixed_st {
+        Some(st) => crate::rmt::at_threshold(&s, st),
+        None => rmt_threshold(&s, opts.rmt_start, min_nodes, opts.alpha),
     };
     let rmt_s = t.elapsed().as_secs_f64();
     eprintln!(
-        "[rmt] st = {:.3} converged={} ({} scan points, {:.2}s)",
-        rmt.st, rmt.converged, rmt.log.len(), rmt_s
+        "[rmt] st = {:.3} converged={}{} ({} scan points, kept {}/{}, E={}, {:.2}s)",
+        rmt.st,
+        rmt.converged,
+        if rmt.fallback { " FALLBACK" } else { "" },
+        rmt.log.len(),
+        rmt.kept.len(),
+        abundance.nrows(),
+        rmt.edges,
+        rmt_s
     );
 
     // restrict to kept nodes
     let kept = &rmt.kept;
     let p = kept.len();
-    let mut A = Mat::zeros((p, p));
-    for (a, &i) in kept.iter().enumerate() {
-        for (b, &j) in kept.iter().enumerate() {
-            A[(a, b)] = rmt.adjacency[(i, j)];
+    let mut a = Mat::zeros((p, p));
+    for (x, &i) in kept.iter().enumerate() {
+        for (y, &j) in kept.iter().enumerate() {
+            a[(x, y)] = rmt.adjacency[(i, j)];
         }
     }
     let kept_names: Vec<String> = kept.iter().map(|&i| otu_names[i].clone()).collect();
     let zk = Mat::from_shape_fn((p, abundance.ncols()), |(i, j)| z[(kept[i], j)]);
-    io::write_csv_matrix(&out_dir.join("adjacency.csv"), &A, &kept_names, &kept_names, "OTU")?;
 
     let t = Instant::now();
-    let topo = network::topology(&A);
+    let (topo, partition) = network::topology_parts(&a);
     let topology_s = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    let mod_analysis = analyze_modules(&A);
+    let mod_analysis: ModuleAnalysis = analyze_modules_with(
+        &network::adjacency_list(&a),
+        topo.modularity,
+        partition,
+    );
     let modules_s = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
     let tz = linalg::standardize_rows(&traits.t().to_owned()).t().to_owned();
     let eig = eigengenes(&zk, &mod_analysis.module_of, mod_analysis.n_modules, &tz);
+    let gs = trait_significance(&zk, traits);
     let eigengene_s = t.elapsed().as_secs_f64();
-    io::write_csv_matrix(
-        &out_dir.join("eigengenes.csv"),
-        &eig.E,
-        &(0..mod_analysis.n_modules).map(|b| format!("module_{}", b + 1)).collect::<Vec<_>>(),
-        sample_names,
-        "module",
-    )?;
-    io::write_csv_matrix(
-        &out_dir.join("fig5_r.csv"),
-        &eig.trait_r,
-        &(0..mod_analysis.n_modules).map(|b| format!("module_{}", b + 1)).collect::<Vec<_>>(),
-        trait_names,
-        "module",
-    )?;
-    io::write_csv_matrix(
-        &out_dir.join("fig5_p.csv"),
-        &eig.trait_p,
-        &(0..mod_analysis.n_modules).map(|b| format!("module_{}", b + 1)).collect::<Vec<_>>(),
-        trait_names,
-        "module",
-    )?;
 
     let t = Instant::now();
-    let mantel = mantel_connectivity_vs_traits(&A, &zk, traits, n_perm, seed);
+    let mantel = mantel_connectivity_vs_traits(&a, &zk, traits, opts.n_perm, opts.seed);
     let mantel_s = t.elapsed().as_secs_f64();
 
-    // module report
     let mut role_counts = std::collections::HashMap::new();
     for r in &mod_analysis.roles {
         *role_counts.entry(r.role.to_string()).or_insert(0) += 1;
     }
 
-    let fig5_r: Vec<Vec<f64>> = (0..eig.trait_r.nrows()).map(|b| (0..eig.trait_r.ncols()).map(|h| eig.trait_r[(b, h)]).collect()).collect();
-    let fig5_p: Vec<Vec<f64>> = (0..eig.trait_p.nrows()).map(|b| (0..eig.trait_p.ncols()).map(|h| eig.trait_p[(b, h)]).collect()).collect();
+    let module_names: Vec<String> = (0..mod_analysis.n_modules)
+        .map(|b| format!("module_{}", b + 1))
+        .collect();
+    let fig5_r: Vec<Vec<f64>> = (0..eig.trait_r.nrows())
+        .map(|b| (0..eig.trait_r.ncols()).map(|h| eig.trait_r[(b, h)]).collect())
+        .collect();
+    let fig5_p: Vec<Vec<f64>> = (0..eig.trait_p.nrows())
+        .map(|b| (0..eig.trait_p.ncols()).map(|h| eig.trait_p[(b, h)]).collect())
+        .collect();
 
     let report = RunReport {
         n_otus: abundance.nrows(),
         n_samples: abundance.ncols(),
         n_traits: traits.ncols(),
         gpu_used,
+        input: InputMeta {
+            abundance: opts.abundance_path.clone(),
+            traits: opts.traits_path.clone(),
+            seed: opts.seed,
+            permutations: opts.n_perm,
+            fixed_threshold: opts.fixed_st,
+        },
         rmt: RmtReport {
             st: rmt.st,
             converged: rmt.converged,
+            fallback: rmt.fallback,
+            alpha: opts.alpha,
             n_points: rmt.log.len(),
-            scan: rmt.log.iter().map(|p| (p.st, p.p, p.chi2, p.poisson)).collect(),
+            n_kept: p,
+            edges: rmt.edges,
+            scan: rmt.log.clone(),
         },
         topology: TopoReport {
             n: topo.n,
             edges: topo.edges,
+            density: topo.density,
             avg_k: topo.avg_k,
             gd: topo.gd,
+            connected_frac: topo.connected_frac,
+            n_components: topo.n_components,
+            giant_frac: topo.giant_frac,
             avg_cc: topo.avg_cc,
             modularity: topo.modularity,
             n_modules: topo.n_modules,
@@ -284,7 +321,12 @@ pub fn run_pipeline(
         eigengene_var_explained: eig.var_explained.clone(),
         fig5_r,
         fig5_p,
-        mantel: MantelReport { r: mantel.r, p: mantel.p, n_perm: mantel.n_perm },
+        mantel: MantelReport {
+            r: mantel.r,
+            p: mantel.p,
+            n_perm: mantel.n_perm,
+            r_null_mean: mantel.r_null_mean,
+        },
         timing_s: Timing {
             standardize_s,
             similarity_s,
@@ -293,204 +335,301 @@ pub fn run_pipeline(
             modules_s,
             eigengene_s,
             mantel_s,
-            total_s: t0.elapsed().as_secs_f64(),
+            export_s: 0.0,
+            total_s: 0.0,
         },
     };
-    io::write_json(&out_dir.join("report.json"), &report)?;
 
-    // roles table
+    if !opts.write_artifacts {
+        let mut report = report;
+        report.timing_s.total_s = t0.elapsed().as_secs_f64();
+        return Ok(RunArtifacts { report, adjacency: a, kept_names });
+    }
+
+    let t = Instant::now();
+    write_artifacts(
+        &opts.out_dir,
+        &a,
+        &kept_names,
+        &s,
+        otu_names,
+        sample_names,
+        trait_names,
+        &rmt,
+        &topo,
+        &mod_analysis,
+        &eig,
+        &gs,
+        &module_names,
+        opts.write_similarity,
+    )?;
+    let export_s = t.elapsed().as_secs_f64();
+
+    let mut report = report;
+    report.timing_s.export_s = export_s;
+    report.timing_s.total_s = t0.elapsed().as_secs_f64();
+    io::write_json(&opts.out_dir.join("report.json"), &report)?;
+
+    Ok(RunArtifacts { report, adjacency: a, kept_names })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_artifacts(
+    out: &Path,
+    a: &Mat,
+    names: &[String],
+    s: &Mat,
+    otu_names: &[String],
+    sample_names: &[String],
+    trait_names: &[String],
+    rmt: &RmtResult,
+    topo: &Topology,
+    ma: &ModuleAnalysis,
+    eig: &crate::eigengene::EigengeneResult,
+    gs: &Mat,
+    module_names: &[String],
+    write_similarity: bool,
+) -> Result<()> {
+    if write_similarity {
+        io::write_csv_matrix(&out.join("similarity.csv"), s, otu_names, otu_names, "OTU")?;
+    }
+    io::write_csv_matrix(&out.join("adjacency.csv"), a, names, names, "OTU")?;
+    io::write_csv_matrix(&out.join("eigengenes.csv"), &eig.E, module_names, sample_names, "module")?;
+    io::write_csv_matrix(&out.join("fig5_r.csv"), &eig.trait_r, module_names, trait_names, "module")?;
+    io::write_csv_matrix(&out.join("fig5_p.csv"), &eig.trait_p, module_names, trait_names, "module")?;
+
+    // edges (weight = |r| when the similarity matrix is available)
     {
-        let names = &kept_names;
-        let mut w = csv::Writer::from_path(out_dir.join("roles.csv"))?;
-        w.write_record(["OTU", "module", "zi", "Pi", "connectivity", "role"])?;
-        for r in &mod_analysis.roles {
+        let mut w = csv::Writer::from_path(out.join("edges.csv"))?;
+        w.write_record(["source", "target", "module_source", "module_target"])?;
+        let n = a.nrows();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if a[(i, j)] > 0.0 {
+                    w.write_record([
+                        names[i].clone(),
+                        names[j].clone(),
+                        format!("{}", ma.module_of[i] + 1),
+                        format!("{}", ma.module_of[j] + 1),
+                    ])?;
+                }
+            }
+        }
+        w.flush()?;
+    }
+
+    // per-OTU table: everything a network viewer or a scatter plot needs
+    {
+        let n = a.nrows();
+        let mut w = csv::Writer::from_path(out.join("nodes.csv"))?;
+        w.write_record([
+            "OTU", "module", "zi", "Pi", "degree", "role", "MM_eigengene", "gs_max", "gs_trait",
+        ])?;
+        for r in &ma.roles {
+            let i = r.node;
+            let (mut gs_max, mut gs_trait) = (f64::NAN, String::new());
+            for h in 0..gs.ncols() {
+                let v = gs[(i, h)];
+                if gs_max.is_nan() || v > gs_max {
+                    gs_max = v;
+                    gs_trait = trait_names.get(h).cloned().unwrap_or_default();
+                }
+            }
+            let _ = n;
             w.write_record([
-                names[r.node].clone(),
+                names[i].clone(),
                 format!("{}", r.module + 1),
                 format!("{:.4}", r.zi),
                 format!("{:.4}", r.pi),
                 format!("{:.0}", r.connectivity),
                 r.role.to_string(),
+                format!("{:.4}", eig.mmie[i]),
+                format!("{:.4}", gs_max),
+                gs_trait,
             ])?;
         }
         w.flush()?;
     }
 
-    Ok(RunArtifacts {
-        report,
-        S,
-        A,
-        kept: kept.clone(),
-        kept_names,
-        E: eig.E.clone(),
-        trait_r: eig.trait_r.clone(),
-        trait_p: eig.trait_p.clone(),
-        trait_names: trait_names.to_vec(),
-        sample_names: sample_names.to_vec(),
-        eig,
-        mod_analysis,
-        topo,
-        rmt,
-    })
-}
-
-#[cfg(feature = "gpu")]
-fn return_continue(S: Mat) -> bool {
-    let _ = S;
-    true
-}
-#[cfg(not(feature = "gpu"))]
-fn return_continue(_S: Mat) -> bool {
-    true
-}
-fn false_marker() -> bool {
-    false
-}
-
-fn csv_of(m: &Mat, rows: &[String], cols: &[String]) -> String {
-    let mut s = String::from("OTU");
-    for c in cols {
-        s.push(',');
-        s.push_str(c);
-    }
-    s.push('\n');
-    for i in 0..m.nrows() {
-        s.push_str(&rows[i]);
-        for j in 0..m.ncols() {
-            s.push_str(&format!(",{:.8}", m[(i, j)]));
+    // RMT scan trace
+    {
+        let mut w = csv::Writer::from_path(out.join("rmt_scan.csv"))?;
+        w.write_record(["st", "p", "edges", "chi2", "dof", "crit", "poisson", "ks"])?;
+        for pt in &rmt.log {
+            w.write_record([
+                format!("{:.4}", pt.st),
+                pt.p.to_string(),
+                pt.edges.to_string(),
+                format!("{:.4}", pt.chi2),
+                pt.dof.to_string(),
+                format!("{:.4}", pt.crit),
+                pt.poisson.to_string(),
+                format!("{:.4}", pt.ks),
+            ])?;
         }
-        s.push('\n');
+        w.flush()?;
     }
-    s
+
+    // spectrum of the kept graph
+    {
+        let mut w = csv::Writer::from_path(out.join("spectrum.csv"))?;
+        w.write_record(["index", "eigenvalue", "spacing"])?;
+        for (i, lam) in rmt.eigenvalues.iter().enumerate() {
+            w.write_record([
+                i.to_string(),
+                format!("{:.6}", lam),
+                rmt.spacings.get(i).map(|v| format!("{v:.6}")).unwrap_or_default(),
+            ])?;
+        }
+        w.flush()?;
+    }
+
+    // degree distribution for the scale-free fit
+    {
+        let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for r in &ma.roles {
+            *counts.entry(r.connectivity as usize).or_insert(0) += 1;
+        }
+        let n = a.nrows().max(1) as f64;
+        let mut w = csv::Writer::from_path(out.join("degree_dist.csv"))?;
+        w.write_record(["k", "count", "pk"])?;
+        for (k, c) in counts {
+            w.write_record([k.to_string(), c.to_string(), format!("{:.6}", c as f64 / n)])?;
+        }
+        w.flush()?;
+    }
+
+    // module table
+    {
+        let mut w = csv::Writer::from_path(out.join("modules.csv"))?;
+        w.write_record(["module", "size", "var_explained"])?;
+        for b in 0..ma.n_modules {
+            w.write_record([
+                format!("{}", b + 1),
+                ma.members[b].len().to_string(),
+                format!("{:.4}", eig.var_explained.get(b).copied().unwrap_or(f64::NAN)),
+            ])?;
+        }
+        w.flush()?;
+    }
+    let _ = topo;
+    Ok(())
 }
 
 // ------------------------------------------------------------------ benchmarks
 pub struct BenchRow {
     pub name: String,
-    pub mode: String,      // cpu | gpu
-    pub stage: String,     // pipeline | similarity
+    pub mode: String,  // cpu | gpu
+    pub stage: String, // pipeline | similarity
     pub n_otus: usize,
     pub n_samples: usize,
     pub seconds: f64,
     pub repeats: usize,
-    pub maxdiff: f64,      // gpu vs cpu correctness (NAN for cpu rows)
+    pub maxdiff: f64, // gpu vs cpu correctness (NAN for cpu rows)
     pub detail: String,
 }
 
+/// Benchmark the real `run_pipeline` (artifacts disabled) instead of the copy of
+/// the pipeline this module used to carry, so the numbers cannot drift from the
+/// code that users run.
 pub fn bench_all(out_dir: &Path) -> Result<Vec<BenchRow>> {
     let _ = out_dir;
     let mut rows = Vec::new();
-    // ---- CPU pipeline scaling matrix (3 repeats, take min) ----
-    let sizes = [(60usize, 12usize), (120, 12), (240, 24), (480, 24), (960, 32), (1920, 48)];
+    let sizes = [
+        (60usize, 12usize),
+        (120, 12),
+        (240, 24),
+        (480, 24),
+        (960, 32),
+        (1920, 48),
+    ];
     for &(n, m) in &sizes {
         let d = crate::simulate::simulate(n, m, 8, 4, 16, 0.45, 42);
-        let mut best: Option<(f64, String)> = None;
-        let mut best_stages = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        for rep in 0..3 {
-            let t0 = Instant::now();
-            let t = Instant::now();
-            let z = linalg::standardize_rows(&d.abundance);
-            let t_std = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let R = linalg::correlation_matrix(&z);
-            let mut S = Mat::zeros((n, n));
-            for i in 0..n {
-                for j in 0..n {
-                    S[(i, j)] = R[(i, j)].abs();
-                }
-                S[(i, i)] = 0.0;
+        let mut best: Option<(f64, crate::pipeline::Timing, String)> = None;
+        for _ in 0..3 {
+            let opts = RunOptions {
+                n_perm: 99,
+                seed: 42,
+                write_artifacts: false,
+                ..Default::default()
+            };
+            let art = run_pipeline(
+                &d.abundance,
+                &d.otu_names,
+                &d.sample_names,
+                &d.traits,
+                &d.trait_names,
+                &opts,
+            )?;
+            let total = art.report.timing_s.total_s;
+            let t = &art.report.timing_s;
+            let detail = format!(
+                "st={:.2} conv={} n={} E={} M={:.3} mods={}",
+                art.report.rmt.st,
+                art.report.rmt.converged,
+                art.report.topology.n,
+                art.report.topology.edges,
+                art.report.topology.modularity,
+                art.report.topology.n_modules
+            );
+            if best.as_ref().map(|(b, _, _)| total < *b).unwrap_or(true) {
+                best = Some((
+                    total,
+                    Timing {
+                        standardize_s: t.standardize_s,
+                        similarity_s: t.similarity_s,
+                        rmt_s: t.rmt_s,
+                        topology_s: t.topology_s,
+                        modules_s: t.modules_s,
+                        eigengene_s: t.eigengene_s,
+                        mantel_s: t.mantel_s,
+                        export_s: t.export_s,
+                        total_s: t.total_s,
+                    },
+                    detail,
+                ));
             }
-            let t_sim = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let rmt = rmt_threshold(&S, 0.01, (n / 10).max(10));
-            let t_rmt = t.elapsed().as_secs_f64();
-            let p = rmt.kept.len();
-            let mut A = Mat::zeros((p, p));
-            for (a, &i) in rmt.kept.iter().enumerate() {
-                for (b, &j) in rmt.kept.iter().enumerate() {
-                    A[(a, b)] = rmt.adjacency[(i, j)];
-                }
-            }
-            let t = Instant::now();
-            let topo = network::topology(&A);
-            let t_topo = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let ma = analyze_modules(&A);
-            let t_mod = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let tz = linalg::standardize_rows(&d.traits.t().to_owned()).t().to_owned();
-            let zk = Mat::from_shape_fn((p, m), |(i, j)| z[(rmt.kept[i], j)]);
-            let _e = eigengenes(&zk, &ma.module_of, ma.n_modules, &tz);
-            let t_eig = t.elapsed().as_secs_f64();
-            let total = t0.elapsed().as_secs_f64();
-            if best.as_ref().map(|(b, _)| total < *b).unwrap_or(true) {
-                best = Some((total, format!(
-                    "std={t_std:.3} sim={t_sim:.3} rmt={t_rmt:.3}(st={:.2},conv={}) topo={t_topo:.3} modules={t_mod:.3} eig={t_eig:.3} | n={} E={} M={:.3} mods={}",
-                    rmt.st, rmt.converged, topo.n, topo.edges, topo.modularity, topo.n_modules)));
-                best_stages = (t_std, t_sim, t_rmt, t_topo, t_mod, t_eig);
-            }
-            let _ = rep;
         }
-        let (total, detail) = best.unwrap();
-        let (t_std, t_sim, t_rmt, t_topo, t_mod, t_eig) = best_stages;
+        let (total, ts, detail) = best.unwrap();
         rows.push(BenchRow {
             name: format!("pipeline n={n} m={m}"),
-            mode: "cpu".into(), stage: "pipeline".into(),
-            n_otus: n, n_samples: m, seconds: total, repeats: 3,
+            mode: "cpu".into(),
+            stage: "pipeline".into(),
+            n_otus: n,
+            n_samples: m,
+            seconds: total,
+            repeats: 3,
             maxdiff: f64::NAN,
-            detail: format!("{detail} [min-of-3; stages: std={t_std:.3} sim={t_sim:.3} rmt={t_rmt:.3} topo={t_topo:.3} mod={t_mod:.3} eig={t_eig:.3}]"),
+            detail: format!(
+                "{detail} [min-of-3; stages: std={:.3} sim={:.3} rmt={:.3} topo={:.3} mod={:.3} eig={:.3} mantel={:.3}]",
+                ts.standardize_s, ts.similarity_s, ts.rmt_s, ts.topology_s, ts.modules_s, ts.eigengene_s, ts.mantel_s
+            ),
         });
     }
-    // ---- per-stage scaling for the two dominant stages: similarity + topology ----
-    for &(n, m) in &sizes {
-        let d = crate::simulate::simulate(n, m, 8, 4, 16, 0.45, 42);
-        let z = linalg::standardize_rows(&d.abundance);
-        let t = Instant::now();
-        let R = linalg::correlation_matrix(&z);
-        let t_sim = t.elapsed().as_secs_f64();
-        let mut S = Mat::zeros((n, n));
-        for i in 0..n { for j in 0..n { S[(i, j)] = R[(i, j)].abs(); } S[(i, i)] = 0.0; }
-        let rmt = rmt_threshold(&S, 0.01, (n / 10).max(10));
-        let p = rmt.kept.len();
-        let mut A = Mat::zeros((p, p));
-        for (a, &i) in rmt.kept.iter().enumerate() {
-            for (b, &j) in rmt.kept.iter().enumerate() { A[(a, b)] = rmt.adjacency[(i, j)]; }
-        }
-        let t = Instant::now();
-        let topo = network::topology(&A);
-        let t_topo = t.elapsed().as_secs_f64();
-        rows.push(BenchRow {
-            name: format!("stage similarity n={n} m={m}"),
-            mode: "cpu".into(), stage: "similarity".into(),
-            n_otus: n, n_samples: m, seconds: t_sim, repeats: 1, maxdiff: f64::NAN,
-            detail: format!("O(n^2 m) pearson+|r|"),
-        });
-        rows.push(BenchRow {
-            name: format!("stage topology n={n} m={m}"),
-            mode: "cpu".into(), stage: "topology".into(),
-            n_otus: n, n_samples: m, seconds: t_topo, repeats: 1, maxdiff: f64::NAN,
-            detail: format!("BFS GD + clustering + greedy modularity | net n={} E={}", topo.n, topo.edges),
-        });
-    }
-    // ---- GPU vs CPU similarity on the same sizes (parity + speed) ----
+
+    // GPU vs CPU similarity at the same sizes (parity + speed)
     #[cfg(feature = "gpu")]
     {
         if crate::gpu::gpu_available() {
-            for &(n, m) in &[(240usize, 24usize), (480, 24), (960, 32), (1920, 48), (3000, 64), (5000, 64), (8000, 96), (12000, 128)] {
+            for &(n, m) in &[
+                (240usize, 24usize),
+                (480, 24),
+                (960, 32),
+                (1920, 48),
+                (3000, 64),
+                (5000, 64),
+                (8000, 96),
+                (12000, 128),
+            ] {
                 let d = crate::simulate::simulate(n, m, 8, 4, 16, 0.45, 7);
                 let z = linalg::standardize_rows(&d.abundance);
-                // CPU: 3 reps min
                 let mut t_cpu = f64::INFINITY;
-                let mut cpu = Mat::zeros((n, n));
+                let mut cpu = linalg::similarity_from_standardized(&z);
                 for _ in 0..3 {
                     let t = Instant::now();
-                    let R = linalg::correlation_matrix(&z);
+                    cpu = linalg::similarity_from_standardized(&z);
                     t_cpu = t_cpu.min(t.elapsed().as_secs_f64());
-                    cpu = R;
                 }
-                for i in 0..n { for j in 0..n { cpu[(i, j)] = cpu[(i, j)].abs(); } cpu[(i, i)] = 0.0; }
-                // GPU: 3 reps min; parity measured against the LAST gpu result only
-                // when it matches CPU shape, using a fresh compute (no reuse of stale buffer)
                 let mut t_gpu = f64::INFINITY;
                 let mut maxd = f64::NAN;
                 for rep in 0..3 {
@@ -500,23 +639,43 @@ pub fn bench_all(out_dir: &Path) -> Result<Vec<BenchRow>> {
                             t_gpu = t_gpu.min(t.elapsed().as_secs_f64());
                             if rep == 2 {
                                 maxd = 0.0;
-                                for i in 0..n { for j in 0..n { maxd = maxd.max((g[(i, j)] - cpu[(i, j)]).abs()); } }
+                                for i in 0..n {
+                                    for j in 0..n {
+                                        maxd = maxd.max((g[(i, j)] - cpu[(i, j)]).abs());
+                                    }
+                                }
                             }
                         }
-                        Err(e) => { eprintln!("[gpu] failed n={n}: {e}"); break; }
+                        Err(e) => {
+                            eprintln!("[gpu] failed n={n}: {e}");
+                            break;
+                        }
                     }
                 }
                 rows.push(BenchRow {
                     name: format!("similarity n={n} m={m}"),
-                    mode: "cpu".into(), stage: "similarity".into(),
-                    n_otus: n, n_samples: m, seconds: t_cpu, repeats: 3, maxdiff: f64::NAN,
-                    detail: format!("rayon CPU min-of-3"),
+                    mode: "cpu".into(),
+                    stage: "similarity".into(),
+                    n_otus: n,
+                    n_samples: m,
+                    seconds: t_cpu,
+                    repeats: 3,
+                    maxdiff: f64::NAN,
+                    detail: "rayon CPU min-of-3".into(),
                 });
                 rows.push(BenchRow {
                     name: format!("similarity n={n} m={m}"),
-                    mode: "gpu".into(), stage: "similarity".into(),
-                    n_otus: n, n_samples: m, seconds: t_gpu, repeats: 3, maxdiff: maxd,
-                    detail: format!("wgpu/Vulkan min-of-3, speedup vs cpu = {:.2}x, maxdiff = {maxd:.2e}", t_cpu / t_gpu.max(1e-12)),
+                    mode: "gpu".into(),
+                    stage: "similarity".into(),
+                    n_otus: n,
+                    n_samples: m,
+                    seconds: t_gpu,
+                    repeats: 3,
+                    maxdiff: maxd,
+                    detail: format!(
+                        "wgpu/Vulkan min-of-3, speedup vs cpu = {:.2}x, maxdiff = {maxd:.2e}",
+                        t_cpu / t_gpu.max(1e-12)
+                    ),
                 });
             }
         } else {

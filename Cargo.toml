@@ -9,7 +9,6 @@ ndarray = "0.16"
 nalgebra = "0.33"
 rand = "0.8"
 rand_distr = "0.4"
-rand_chacha = "0.9"
 statrs = "0.17"
 csv = "1.3"
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +24,28 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# The examples poke the GPU path directly, so they only build with that feature;
+# without this they broke `cargo test` on a default checkout.
+[[example]]
+name = "gpu_test"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_debug"
+required-features = ["gpu"]
+
+[[example]]
+name = "parity_3000"
+required-features = ["gpu"]
+
+[[example]]
+name = "parity_loc"
+required-features = ["gpu"]
+
+[[example]]
+name = "parity_sizes"
+required-features = ["gpu"]
 
 [profile.release]
 opt-level = 3

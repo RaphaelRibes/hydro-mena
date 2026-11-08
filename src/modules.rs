@@ -23,11 +23,16 @@ pub struct ModuleAnalysis {
     pub roles: Vec<Role>,
 }
 
-pub fn analyze_modules(A: &Mat) -> ModuleAnalysis {
-    let adj = adjacency_list(A);
+pub fn analyze_modules(a: &Mat) -> ModuleAnalysis {
+    let adj = adjacency_list(a);
+    let (m, assign) = greedy_modularity(&adj);
+    analyze_modules_with(&adj, m, assign)
+}
+
+/// Module roles on an existing partition: the caller already optimised
+/// modularity (see `network::topology_parts`), so it must not be run twice.
+pub fn analyze_modules_with(adj: &[Vec<usize>], m: f64, mut assign: Vec<usize>) -> ModuleAnalysis {
     let n = adj.len();
-    let m2 = adj.iter().map(|a| a.len()).sum::<usize>() as f64;
-    let (M, mut assign) = greedy_modularity(&adj);
     // order modules by size desc and relabel 0..K-1
     let mut sizes: HashMap<usize, usize> = HashMap::new();
     for &a in &assign {
@@ -113,7 +118,7 @@ pub fn analyze_modules(A: &Mat) -> ModuleAnalysis {
     }
 
     ModuleAnalysis {
-        modularity: M,
+        modularity: m,
         n_modules: k_modules,
         members,
         module_of: assign,

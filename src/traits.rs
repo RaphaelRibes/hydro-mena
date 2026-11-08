@@ -6,17 +6,15 @@ use crate::linalg::Mat;
 use crate::network::adjacency_list;
 use crate::stats;
 
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-
 pub struct MantelResult {
     pub r: f64,
     pub p: f64,
     pub n_perm: usize,
+    /// mean r under the permutation null, so the effect size is interpretable
+    pub r_null_mean: f64,
 }
 
 pub fn mantel_connectivity_vs_traits(A: &Mat, z: &Mat, traits: &Mat, n_perm: usize, seed: u64) -> MantelResult {
-    let mut rng = StdRng::seed_from_u64(seed);
     let adj = adjacency_list(A);
     let n = adj.len();
     let k: Vec<f64> = adj.iter().map(|a| a.len() as f64).collect();
@@ -36,6 +34,6 @@ pub fn mantel_connectivity_vs_traits(A: &Mat, z: &Mat, traits: &Mat, n_perm: usi
             gd.push(s.sqrt());
         }
     }
-    let (r, p) = stats::mantel(&kd, &gd, n_perm, &mut rng);
-    MantelResult { r, p, n_perm }
+    let (r, p, r_null_mean) = stats::mantel_condensed(&kd, &gd, n, n_perm, seed);
+    MantelResult { r, p, n_perm, r_null_mean }
 }

@@ -58,34 +58,48 @@ pub fn read_traits_csv(path: &Path, samples: &[String]) -> Result<(Mat, Vec<Stri
     let mut rdr = csv::Reader::from_path(path)?;
     let header = rdr.headers()?.clone();
     let trait_names: Vec<String> = header.iter().skip(1).map(|s| s.to_string()).collect();
-    let mut rows: Vec<Vec<f64>> = Vec::new();
-    let mut names = Vec::new();
+    // Index by sample name instead of a linear `contains` scan per row, and
+    // reject a file that does not cover every abundance column. The old version
+    // silently returned a shorter matrix, and every downstream correlation then
+    // paired OTU rows with the wrong samples (pearson() truncates to the shorter
+    // vector, so nothing raised).
+    let mut by_sample: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
     for rec in rdr.records() {
         let rec = rec?;
         let id = rec[0].to_string();
-        if !samples.contains(&id) {
-            continue;
-        }
-        names.push(id);
         let mut row = Vec::with_capacity(trait_names.len());
         for j in 1..rec.len() {
-            row.push(rec[j].parse::<f64>().context("non-numeric trait")?);
+            row.push(
+                rec[j]
+                    .parse::<f64>()
+                    .with_context(|| format!("non-numeric trait value in sample {id}"))?,
+            );
         }
-        rows.push(row);
-    }
-    // align to sample order
-    let mut aligned: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
-    let mut aligned_names = Vec::with_capacity(samples.len());
-    for s in samples {
-        if let Some(pos) = names.iter().position(|x| x == s) {
-            aligned.push(rows[pos].clone());
-            aligned_names.push(s.clone());
+        if row.len() != trait_names.len() {
+            anyhow::bail!(
+                "{}: sample {id} has {} values but the header declares {} traits",
+                path.display(),
+                row.len(),
+                trait_names.len()
+            );
         }
+        by_sample.insert(id, row);
     }
-    let n = aligned.len();
+    let missing: Vec<&String> = samples.iter().filter(|s| !by_sample.contains_key(*s)).collect();
+    if !missing.is_empty() {
+        let head: Vec<&str> = missing.iter().take(5).map(|s| s.as_str()).collect();
+        anyhow::bail!(
+            "{}: {} of {} abundance samples have no trait row (e.g. {:?}); \\
+             the trait table must cover every sample column",
+            path.display(),
+            missing.len(),
+            samples.len(),
+            head
+        );
+    }
     let m = trait_names.len();
-    let data = Mat::from_shape_fn((n, m), |(i, j)| aligned[i][j]);
-    Ok((data, aligned_names, trait_names))
+    let data = Mat::from_shape_fn((samples.len(), m), |(i, j)| by_sample[&samples[i]][j]);
+    Ok((data, samples.to_vec(), trait_names))
 }
 
 pub fn write_json<T: Serialize>(path: &Path, obj: &T) -> Result<()> {

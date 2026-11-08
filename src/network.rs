@@ -1,8 +1,20 @@
 //! Network topology indices (paper Table 1): connectivity, average path length
 //! (GD), average clustering coefficient, modularity, scale-free R^2 (power law
-//! of degree distribution), hierarchy R^2 (C(k) ~ k^-gamma).
+//! of the degree distribution), hierarchy R^2 (C(k) ~ k^-gamma).
+//!
+//! Two hot loops were asymptotically wrong and are fixed here:
+//!   * clustering tested edge existence with `Vec::contains` inside a double
+//!     loop over every neighbour pair — O(k^3) per node. Now a sorted-list
+//!     intersection, O(k^2).
+//!   * the modularity optimiser recomputed every community's total degree by
+//!     scanning all n nodes for *each candidate move* — O(n^2) per pass. Totals
+//!     are now maintained incrementally (Louvain phase-1 style).
+//! Breadth-first search runs in parallel over source nodes with per-thread
+//! scratch buffers.
 use crate::linalg::Mat;
 use crate::stats;
+use rayon::prelude::*;
+use std::collections::BTreeMap;
 
 pub struct Topology {
     pub n: usize,
@@ -15,15 +27,22 @@ pub struct Topology {
     pub r2_powerlaw: f64,
     pub gamma: f64,
     pub r2_hierarchy: f64,
+    /// edges / possible edges
+    pub density: f64,
+    pub n_components: usize,
+    /// fraction of nodes in the largest connected component
+    pub giant_frac: f64,
+    /// fraction of ordered pairs that are connected (GD is computed over these)
+    pub connected_frac: f64,
 }
 
-/// Build adjacency list from symmetric 0/1 matrix.
-pub fn adjacency_list(A: &Mat) -> Vec<Vec<usize>> {
-    let n = A.nrows();
+/// Build the adjacency list from a symmetric 0/1 matrix.
+pub fn adjacency_list(a: &Mat) -> Vec<Vec<usize>> {
+    let n = a.nrows();
     let mut adj = vec![Vec::new(); n];
     for i in 0..n {
         for j in (i + 1)..n {
-            if A[(i, j)] > 0.0 {
+            if a[(i, j)] > 0.0 {
                 adj[i].push(j);
                 adj[j].push(i);
             }
@@ -55,118 +74,151 @@ fn connected_components(adj: &[Vec<usize>]) -> Vec<usize> {
     comp
 }
 
-/// Average shortest path length over reachable pairs (GD).
-pub fn avg_path_length(adj: &[Vec<usize>]) -> f64 {
+/// Average shortest path length over reachable pairs (GD), in parallel over
+/// source nodes. Each rayon worker reuses one distance and one queue buffer.
+/// Returns (gd, connected_fraction).
+pub fn avg_path_length(adj: &[Vec<usize>]) -> (f64, f64) {
     let n = adj.len();
-    let mut total = 0.0;
-    let mut count = 0u64;
-    for s in 0..n {
-        let mut dist = vec![usize::MAX; n];
-        dist[s] = 0;
-        let mut queue = std::collections::VecDeque::from(vec![s]);
-        while let Some(u) = queue.pop_front() {
-            for &v in &adj[u] {
-                if dist[v] == usize::MAX {
-                    dist[v] = dist[u] + 1;
-                    queue.push_back(v);
+    if n < 2 {
+        return (f64::NAN, 0.0);
+    }
+    let (total, count) = (0..n)
+        .into_par_iter()
+        .fold(
+            || (0u64, 0u64, vec![u32::MAX; n], Vec::<u32>::with_capacity(n)),
+            |(mut tot, mut cnt, mut dist, mut queue), s| {
+                for d in dist.iter_mut() {
+                    *d = u32::MAX;
                 }
-            }
-        }
-        for t in (s + 1)..n {
-            if dist[t] != usize::MAX {
-                total += dist[t] as f64;
-                count += 1;
-            }
-        }
-    }
-    if count > 0 {
-        total / count as f64
-    } else {
-        f64::NAN
-    }
-}
-
-pub fn clustering_coefficients(adj: &[Vec<usize>]) -> Vec<f64> {
-    let n = adj.len();
-    let k: Vec<usize> = adj.iter().map(|a| a.len()).collect();
-    (0..n)
-        .map(|i| {
-            if k[i] < 2 {
-                0.0
-            } else {
-                let mut links = 0usize;
-                for a in 0..adj[i].len() {
-                    for b in (a + 1)..adj[i].len() {
-                        let u = adj[i][a];
-                        let v = adj[i][b];
-                        if adj[u].contains(&v) {
-                            links += 1;
+                queue.clear();
+                dist[s] = 0;
+                queue.push(s as u32);
+                let mut head = 0usize;
+                while head < queue.len() {
+                    let u = queue[head] as usize;
+                    head += 1;
+                    let du = dist[u];
+                    for &v in &adj[u] {
+                        if dist[v] == u32::MAX {
+                            dist[v] = du + 1;
+                            queue.push(v as u32);
                         }
                     }
                 }
-                2.0 * links as f64 / (k[i] * (k[i] - 1)) as f64
-            }
-        })
-        .collect()
+                for t in (s + 1)..n {
+                    if dist[t] != u32::MAX {
+                        tot += dist[t] as u64;
+                        cnt += 1;
+                    }
+                }
+                (tot, cnt, dist, queue)
+            },
+        )
+        .map(|(t, c, _, _)| (t, c))
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let gd = if count > 0 { total as f64 / count as f64 } else { f64::NAN };
+    let possible = (n * (n - 1) / 2) as f64;
+    (gd, if possible > 0.0 { count as f64 / possible } else { 0.0 })
 }
 
-/// Greedy modularity optimization (Clauset-Newman-Moore), returns (M, assignment).
-/// Assignment: module id per node. Uses the standard agglomerative approach.
+/// Local clustering coefficients: for each node, the neighbours are sorted once
+/// and the number of triangles is counted by list intersection, O(k^2) per node
+/// instead of the previous O(k^3) `contains` scan.
+pub fn clustering_coefficients(adj: &[Vec<usize>]) -> Vec<f64> {
+    let mut sorted: Vec<Vec<usize>> = adj.to_vec();
+    for l in sorted.iter_mut() {
+        l.sort_unstable();
+    }
+    let n = sorted.len();
+    let mut cc = vec![0.0f64; n];
+    for i in 0..n {
+        let k = sorted[i].len();
+        if k < 2 {
+            continue;
+        }
+        let ni = &sorted[i];
+        let mut common = 0usize;
+        for &u in ni {
+            let nu = &sorted[u];
+            // |N(i) ∩ N(u)|
+            let (mut a, mut b) = (0usize, 0usize);
+            while a < ni.len() && b < nu.len() {
+                match ni[a].cmp(&nu[b]) {
+                    std::cmp::Ordering::Less => a += 1,
+                    std::cmp::Ordering::Greater => b += 1,
+                    std::cmp::Ordering::Equal => {
+                        common += 1;
+                        a += 1;
+                        b += 1;
+                    }
+                }
+            }
+        }
+        // sum_u |N(i) ∩ N(u)| counts every triangle twice, so 2T_i = common,
+        // and C_i = 2T_i / (k(k-1)) = common / (k(k-1)).
+        cc[i] = common as f64 / (k * (k - 1)) as f64;
+    }
+    cc
+}
+
+/// Modularity optimisation, Louvain phase 1 with an incremental community-total
+/// table: O(E) per sweep instead of O(n^2) per candidate move.
+/// Returns (Q, community id per node) with compact labels.
 pub fn greedy_modularity(adj: &[Vec<usize>]) -> (f64, Vec<usize>) {
     let n = adj.len();
-    let m2 = adj.iter().map(|a| a.len()).sum::<usize>() as f64; // 2L
+    let m2: f64 = adj.iter().map(|a| a.len()).sum::<usize>() as f64; // 2L
     if m2 == 0.0 || n == 0 {
         return (0.0, vec![0; n]);
     }
+    let k: Vec<f64> = adj.iter().map(|a| a.len() as f64).collect();
     let mut assign: Vec<usize> = (0..n).collect();
-    let mut k: Vec<f64> = adj.iter().map(|a| a.len() as f64).collect();
-    // e_ij fraction of edges between communities; maintain via delta-Q merge
-    // Simpler: use Louvain-like one-level passes on the modularity matrix.
-    // Here: iterative best-move (Louvain phase 1) which is equivalent in spirit
-    // and deterministic.
+    // tot[c] = sum of degrees in community c (includes every node currently in c)
+    let mut tot: Vec<f64> = k.clone();
+    // scratch: degree from i into each community, with a sparse reset list
+    let mut into = vec![0.0f64; n];
+    let mut touched: Vec<usize> = Vec::new();
     let mut improved = true;
-    let mut iter = 0;
-    while improved && iter < 100 {
+    let mut sweep = 0;
+    while improved && sweep < 100 {
         improved = false;
-        iter += 1;
+        sweep += 1;
         for i in 0..n {
             let cur = assign[i];
-            // degree of i into each neighboring community
-            let mut into: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
-            for &v in &adj[i] {
-                *into.entry(assign[v]).or_insert(0.0) += 1.0;
-            }
             let ki = k[i];
-            let mut best_comm = cur;
-            let mut best_gain = 0.0f64;
-            let mut candidates: Vec<usize> = into.keys().cloned().collect();
-            candidates.push(cur);
-            candidates.sort();
-            candidates.dedup();
-            for &c in &candidates {
-                if c == cur {
-                    continue;
+            if ki == 0.0 {
+                continue;
+            }
+            touched.clear();
+            for &v in &adj[i] {
+                let c = assign[v];
+                if into[c] == 0.0 {
+                    touched.push(c);
                 }
-                let kin = *into.get(&c).unwrap_or(&0.0);
-                // remove i from cur, add to c: delta Q (up to factor 1/m2)
-                let k_in_cur = *into.get(&cur).unwrap_or(&0.0) - 1.0; // links to cur minus self-loop none
-                let _ = k_in_cur;
-                let tot_c = community_degree(&assign, &k, c);
-                let tot_cur = community_degree(&assign, &k, cur) - ki;
-                let gain = (kin - ki * tot_c / m2) - (k_in_cur.max(0.0) - ki * tot_cur / m2);
+                into[c] += 1.0;
+            }
+            // take i out of its community so totals exclude it
+            tot[cur] -= ki;
+            let mut best_c = cur;
+            let mut best_gain = into[cur] - ki * tot[cur] / m2; // gain of staying (i as its own group is 0)
+            for &c in &touched {
+                let gain = into[c] - ki * tot[c] / m2;
                 if gain > best_gain + 1e-12 {
                     best_gain = gain;
-                    best_comm = c;
+                    best_c = c;
                 }
             }
-            if best_comm != cur {
-                assign[i] = best_comm;
+            tot[best_c] += ki;
+            if best_c != cur {
+                assign[i] = best_c;
                 improved = true;
+            }
+            for &c in &touched {
+                into[c] = 0.0;
             }
         }
     }
     // compact labels
-    let mut map = std::collections::HashMap::new();
+    let mut map: BTreeMap<usize, usize> = BTreeMap::new();
     let mut next = 0usize;
     for a in assign.iter_mut() {
         let e = map.entry(*a).or_insert_with(|| {
@@ -176,21 +228,15 @@ pub fn greedy_modularity(adj: &[Vec<usize>]) -> (f64, Vec<usize>) {
         });
         *a = *e;
     }
-    let M = modularity(adj, &assign, m2);
-    (M, assign)
-}
-
-fn community_degree(assign: &[usize], k: &[f64], c: usize) -> f64 {
-    assign
-        .iter()
-        .enumerate()
-        .filter(|(_, &a)| a == c)
-        .map(|(i, _)| k[i])
-        .sum()
+    let q = modularity(adj, &assign, m2);
+    (q, assign)
 }
 
 /// Modularity Q (Eq. 7).
 pub fn modularity(adj: &[Vec<usize>], assign: &[usize], m2: f64) -> f64 {
+    if m2 <= 0.0 {
+        return 0.0;
+    }
     let n = adj.len();
     let mut q = 0.0;
     for i in 0..n {
@@ -203,20 +249,30 @@ pub fn modularity(adj: &[Vec<usize>], assign: &[usize], m2: f64) -> f64 {
     q / m2
 }
 
-pub fn topology(A: &Mat) -> Topology {
-    let adj = adjacency_list(A);
+/// Topology of the graph, plus the community partition it found (so callers do
+/// not run the optimiser a second time for module roles).
+pub fn topology_parts(a: &Mat) -> (Topology, Vec<usize>) {
+    let adj = adjacency_list(a);
     let n = adj.len();
-    let edges = adj.iter().map(|a| a.len()).sum::<usize>() / 2;
-    let k: Vec<f64> = adj.iter().map(|a| a.len() as f64).collect();
+    let edges = adj.iter().map(|x| x.len()).sum::<usize>() / 2;
+    let k: Vec<f64> = adj.iter().map(|x| x.len() as f64).collect();
     let avg_k = stats::mean(&k);
-    let gd = avg_path_length(&adj);
+    let (gd, connected_frac) = avg_path_length(&adj);
     let cc = clustering_coefficients(&adj);
     let avg_cc = stats::mean(&cc);
-    let (M, assign) = greedy_modularity(&adj);
+    let (m, assign) = greedy_modularity(&adj);
     let n_modules = assign.iter().cloned().collect::<std::collections::HashSet<_>>().len();
 
-    // scale-free: linear fit log10 P(k) vs log10 k
-    let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let comp = connected_components(&adj);
+    let n_components = comp.iter().max().map(|m| m + 1).unwrap_or(0);
+    let mut sizes = vec![0usize; n_components];
+    for &c in &comp {
+        sizes[c] += 1;
+    }
+    let giant = sizes.iter().copied().max().unwrap_or(0) as f64 / n.max(1) as f64;
+
+    // scale-free: linear fit of log10 P(k) on log10 k
+    let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
     for &kv in &k {
         *counts.entry(kv as usize).or_insert(0) += 1;
     }
@@ -226,19 +282,18 @@ pub fn topology(A: &Mat) -> Topology {
         let ly: Vec<f64> = ks
             .iter()
             .map(|x| (counts[&(*x as usize)] as f64 / n as f64).log10())
-            .collect();        let (r, slope) = linreg(&lx, &ly);
+            .collect();
+        let (r, slope) = linreg(&lx, &ly);
         (r * r, -slope)
     } else {
         (f64::NAN, f64::NAN)
     };
 
-    // hierarchy: log C(k) vs log k where C(k) > 0
-    let mut pts: Vec<(f64, f64)> = Vec::new();
-    for i in 0..n {
-        if k[i] > 1.0 && cc[i] > 0.0 {
-            pts.push((k[i].log10(), cc[i].log10()));
-        }
-    }
+    // hierarchy: log C(k) on log k where C(k) > 0
+    let pts: Vec<(f64, f64)> = (0..n)
+        .filter(|&i| k[i] > 1.0 && cc[i] > 0.0)
+        .map(|i| (k[i].log10(), cc[i].log10()))
+        .collect();
     let r2_hierarchy = if pts.len() >= 3 {
         let lx: Vec<f64> = pts.iter().map(|p| p.0).collect();
         let ly: Vec<f64> = pts.iter().map(|p| p.1).collect();
@@ -248,19 +303,33 @@ pub fn topology(A: &Mat) -> Topology {
         f64::NAN
     };
 
-    let _ = connected_components(&adj);
-    Topology {
+    let density = if n > 1 {
+        2.0 * edges as f64 / (n * (n - 1)) as f64
+    } else {
+        0.0
+    };
+
+    let topo = Topology {
         n,
         edges,
         avg_k,
         gd,
         avg_cc,
-        modularity: M,
+        modularity: m,
         n_modules,
         r2_powerlaw,
         gamma,
         r2_hierarchy,
-    }
+        density,
+        n_components,
+        giant_frac: giant,
+        connected_frac,
+    };
+    (topo, assign)
+}
+
+pub fn topology(a: &Mat) -> Topology {
+    topology_parts(a).0
 }
 
 pub fn linreg(x: &[f64], y: &[f64]) -> (f64, f64) {
@@ -278,4 +347,57 @@ pub fn linreg(x: &[f64], y: &[f64]) -> (f64, f64) {
     let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
     let r = if sxx > 0.0 && syy > 0.0 { sxy / (sxx * syy).sqrt() } else { 0.0 };
     (r, slope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// two triangles joined by a single edge
+    fn dumbell() -> Vec<Vec<usize>> {
+        vec![
+            vec![1, 2],
+            vec![0, 2],
+            vec![0, 1, 3],
+            vec![2, 4, 5],
+            vec![3, 5],
+            vec![3, 4],
+        ]
+    }
+
+    #[test]
+    fn clustering_of_a_triangle_is_one() {
+        let adj = vec![vec![1, 2], vec![0, 2], vec![0, 1]];
+        let cc = clustering_coefficients(&adj);
+        for v in cc {
+            assert!((v - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn clustering_of_dumbell() {
+        let cc = clustering_coefficients(&dumbell());
+        // nodes 2 and 3 sit in one triangle each and have a third, non-closed edge
+        assert!((cc[2] - 1.0 / 3.0).abs() < 1e-12, "{cc:?}");
+        assert!((cc[0] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn modularity_finds_the_two_groups() {
+        let (q, assign) = greedy_modularity(&dumbell());
+        assert!(q > 0.3, "Q={q}");
+        assert_eq!(assign[0], assign[1]);
+        assert_eq!(assign[0], assign[2]);
+        assert_eq!(assign[3], assign[4]);
+        assert_ne!(assign[0], assign[3]);
+    }
+
+    #[test]
+    fn path_length_of_a_path_is_known() {
+        // 0-1-2-3: distances 1,2,3,1,2,1 over 6 pairs
+        let adj = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let (gd, frac) = avg_path_length(&adj);
+        assert!((gd - 10.0 / 6.0).abs() < 1e-12, "gd={gd}");
+        assert!((frac - 1.0).abs() < 1e-12);
+    }
 }
