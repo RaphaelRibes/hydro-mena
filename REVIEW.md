@@ -58,19 +58,25 @@ normalise to unit mean, then a **binned** χ² GOF against Poisson (bins merged
 until expected ≥ 5, dof = bins − 2). `ScanPoint` now carries `p`, `edges`,
 `chi2`, `dof`, `crit`, `ks`.
 
-## 2. Honest behaviour when no threshold is accepted
+## 2. Threshold behaviour depends on the degeneracy policy
 
-On the real `ox` data no threshold passes at α = 0.01 — consistent with the vault
-note `rmt-threshold.md`. The old code reported `converged = true` anyway
-(`!log_coarse.is_empty()`) and returned the last scanned point. Now:
+On the real `ox` data the outcome **depends on the degeneracy policy** — this is
+the most fragile part of the build and must be read as experimental:
 
-```
-[rmt] st = 0.500 converged=false FALLBACK (14 scan points, kept 168/173, E=910)
-```
+| build | ox result |
+|---|---|
+| before eigenvalue dedup | no acceptance → fallback st=0.50 (168/173, E=910) |
+| current (ties collapsed, ≥20 spacings) | **converges st=0.70** (140/173, E=361, M=0.845) |
 
-and `report.json` carries `rmt.fallback: true`, which the GUI shows as a warning.
-The fallback picks the point with the smallest χ²/critical ratio. Against the
-2025 repo's reference network (`adjacency_matrix_ox.csv`,
+Deng's MENA does not drop degenerate eigenvalues; collapsing ties at 1e-9 is my
+choice, and it moves the accepted threshold by 0.2. The scan is also weakly
+powered: at n=960 it produces **0** valid points and falls back on a 19-node
+remnant, and at n=1920 it "converges" on a **single** scan point. A 20-node
+remnant passing a goodness-of-fit test means little, so no threshold-dependent
+claim should be published from this build. `rmt_scan.csv` now records `dof` and
+per-point χ² so low-power points are visible.
+
+Against the 2025 repo's reference network (`adjacency_matrix_ox.csv`,
 `data/network_indexes_ox.json`):
 
 | | repo | ours @ st=0.52 (fixed) | ours (RMT scan) |
@@ -135,10 +141,17 @@ The unpinned RMT scan converges at st=0.70 and returns a much sparser graph
 - `viz.py all` produces 7 PNG+SVG; GUI serves `/api/runs`, `/api/run` and the page
   (verified with curl).
 
-**Not measured:** a like-for-like speedup table. The old timings in
-`05-Benchmarks/cpu-scaling.md` were taken on the degenerate complete graph, so
-they are not comparable; the fixes above are asymptotic changes, not tuning.
-Run `hydro-mena bench` on the desktop for a fresh matrix before quoting numbers.
+**Measured on the desktop** (`cachyos-x8664`, Ryzen 7 5800X3D, 16 threads,
+RTX 2080 Ti via Vulkan, commit `1e8e439`, min-of-3, artifacts off): the CPU
+pipeline runs 0.0017 s at n=60 and **55.1 s at n=1920**, of which **RMT is
+55.0 s**. The corrected threshold makes the graphs sparse, so topology is now
+~0 s and the eigendecompositions are the whole cost — the bottleneck moved.
+Similarity: CPU 1.499 s vs GPU 1.523 s at n=12000, i.e. **0.98× — parity, not a
+win**, with maxdiff 2.3e-7…7.9e-7 (PASS). The old "4.71× at n=12000" is
+obsolete because the *CPU* path was parallelised (16 threads, ~4.7× faster than
+its own serial baseline), not because the GPU regressed; the GPU still pays a
+fixed ~0.35 s. Full matrix with provenance in
+`hydro-mena-vault/05-Benchmarks/bench-2026-11-08.md`.
 
 ## 6. Roadmap
 
