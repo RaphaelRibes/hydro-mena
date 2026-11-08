@@ -233,20 +233,35 @@ pub fn greedy_modularity(adj: &[Vec<usize>]) -> (f64, Vec<usize>) {
 }
 
 /// Modularity Q (Eq. 7).
+///
+/// Q = sum_c [ L_c / 2E - (d_c / 2E)^2 ], where L_c counts *directed* internal
+/// edges of community c and d_c is its summed degree. The previous version
+/// summed (1 - k_i k_j/2E) over existing edges only, which omits the
+/// configuration-model term for **non-edges** (and the diagonal): it returns
+/// 1/n instead of 0 for a complete graph in a single community, so every
+/// reported modularity was inflated.
 pub fn modularity(adj: &[Vec<usize>], assign: &[usize], m2: f64) -> f64 {
     if m2 <= 0.0 {
         return 0.0;
     }
     let n = adj.len();
-    let mut q = 0.0;
+    let mut tot = std::collections::HashMap::<usize, f64>::new();
+    let mut internal = std::collections::HashMap::<usize, f64>::new();
     for i in 0..n {
+        let k = adj[i].len() as f64;
+        *tot.entry(assign[i]).or_insert(0.0) += k;
         for &j in &adj[i] {
-            if assign[i] == assign[j] {
-                q += 1.0 - (adj[i].len() as f64 * adj[j].len() as f64) / m2;
+            if assign[j] == assign[i] {
+                *internal.entry(assign[i]).or_insert(0.0) += 1.0;
             }
         }
     }
-    q / m2
+    let mut q = 0.0;
+    for (c, &d) in &tot {
+        let l = internal.get(c).copied().unwrap_or(0.0);
+        q += l / m2 - (d / m2).powi(2);
+    }
+    q
 }
 
 /// Topology of the graph, plus the community partition it found (so callers do
@@ -380,6 +395,42 @@ mod tests {
         // nodes 2 and 3 sit in one triangle each and have a third, non-closed edge
         assert!((cc[2] - 1.0 / 3.0).abs() < 1e-12, "{cc:?}");
         assert!((cc[0] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn modularity_of_complete_graph_is_zero() {
+        // A complete graph in a single community has Q = 0 by definition.
+        // The old edge-only sum returned 1/n here, which is why every reported
+        // modularity was inflated.
+        let n = 6;
+        let mut adj = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    adj[i].push(j);
+                }
+            }
+        }
+        let assign = vec![0usize; n];
+        let m2: f64 = adj.iter().map(|a| a.len()).sum::<usize>() as f64;
+        let q = modularity(&adj, &assign, m2);
+        assert!(q.abs() < 1e-12, "complete graph Q must be 0, got {q}");
+    }
+
+    #[test]
+    fn modularity_of_two_disjoint_triangles_is_half() {
+        // two K3, one community each: Q = 2 * (6/12 - (6/12)^2) = 0.5
+        let adj = vec![
+            vec![1, 2],
+            vec![0, 2],
+            vec![0, 1],
+            vec![4, 5],
+            vec![3, 5],
+            vec![3, 4],
+        ];
+        let assign = vec![0usize, 0, 0, 1, 1, 1];
+        let q = modularity(&adj, &assign, 12.0);
+        assert!((q - 0.5).abs() < 1e-12, "got {q}");
     }
 
     #[test]

@@ -4,8 +4,9 @@
 //! rayon over disjoint row blocks (`par_chunks_mut`, no shared writes), and the
 //! symmetric eigenproblem goes through a Householder + implicit-QR solver
 //! instead of the previous "find the largest off-diagonal element, rotate,
-//! repeat" Jacobi loop that rescanned the whole matrix on every rotation
-//! (O(n^4) per decomposition and unbounded iterations).
+//! repeat" Jacobi loop: that rescanned the whole matrix on every rotation
+//! (O(n^4) per decomposition) and was capped at 200 sweeps, so large matrices
+//! could also return an unconverged spectrum without any diagnostic.
 
 use ndarray::Array2;
 use rayon::prelude::*;

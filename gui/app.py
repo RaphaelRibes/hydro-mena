@@ -78,7 +78,7 @@ def load_run(path: str) -> dict:
 
 # ------------------------------------------------------------------ http layer
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):  # quiet: local-only diagnostics server
+    def log_message(self, format, *args):  # noqa: A002 - base class signature
         pass
 
     def _send(self, code: int, body: bytes, ctype: str):
@@ -180,12 +180,16 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;padding:10
 </main>
 <script>
 const $=s=>document.querySelector(s), S={run:null,tab:'overview'};
+// CSV-derived identifiers (OTU/module names, run paths) are interpolated into
+// markup, so escape them: the data files are external input.
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{S.tab=b.dataset.t;
  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===S.tab)); draw();});
 const fmt=(v,d=2)=>v==null||isNaN(v)?'—':(+v).toFixed(d);
 async function loadRuns(sel){const r=await (await fetch('/api/runs')).json();
- $('#runs').innerHTML=r.map(x=>`<option ${x.path===sel?'selected':''} value="${x.path}">${x.path} · ${x.n_otus}×${x.n_samples} · st ${fmt(x.st,3)} · M ${fmt(x.modularity)}</option>`).join('');
+ $('#runs').innerHTML=r.map(x=>`<option ${x.path===sel?'selected':''} value="${esc(x.path)}">${esc(x.path)} · ${x.n_otus}×${x.n_samples} · st ${fmt(x.st,3)} · M ${fmt(x.modularity)}</option>`).join('');
  if(!sel&&r.length)return loadRun(r[0].path);}
 async function loadRun(p){$('#status').textContent='loading…';const r=await (await fetch('/api/run?path='+encodeURIComponent(p))).json();
  if(r.error){$('#status').textContent=r.error;return;} S.run=r;$('#status').textContent=p;draw();}
@@ -198,15 +202,20 @@ function cards(r){const t=r.report.topology,m=r.report.modules,x=r.report.rmt;
  ['Mantel r',fmt(r.report.mantel.r,3)],['mantel p',fmt(r.report.mantel.p,3)]];
  $('#cards').innerHTML=rows.map(([k,v])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');}
 function overview(r){cards(r);const x=r.report.rmt;
- $('#banner').innerHTML = x.converged
-  ? `<div class="ok"><b>RMT converged</b> at st=${fmt(x.st,3)} — the spacing GOF was compatible with Poisson.</div>`
-  : `<div class="warn"><b>No threshold accepted the Poisson GOF.</b> st=${fmt(x.st,3)} is a diagnostic fallback (closest to critical). Treat the graph as threshold-sensitive; use the RMT tab, or pin <code>--st</code> to a value you can defend.</div>`;
+ const fixed = r.report.input && r.report.input.fixed_threshold != null;
+ // A fixed --st run is a deliberate choice, not a failed RMT scan: reporting it
+ // as a fallback failure was misleading.
+ $('#banner').innerHTML = fixed
+  ? `<div class="ok"><b>Fixed threshold</b> st=${fmt(x.st,3)} — the RMT scan was skipped by request, so no Poisson verdict exists for this graph.</div>`
+  : x.converged
+   ? `<div class="ok"><b>RMT converged</b> at st=${fmt(x.st,3)} — the spacing GOF was compatible with Poisson.</div>`
+   : `<div class="warn"><b>No threshold accepted the Poisson GOF.</b> st=${fmt(x.st,3)} is a diagnostic fallback (closest to critical). Treat the graph as threshold-sensitive; use the RMT tab, or pin <code>--st</code> to a value you can defend.</div>`;
  const mods=r.modules;const c=$('#c_sizes'),g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);
  const w=c.width/mods.length;mods.forEach((m,i)=>{const h=+m.size/ Math.max(...mods.map(z=>+z.size))*190;
   g.fillStyle='hsl('+(i*360/Math.max(1,mods.length))+',65%,55%)';g.fillRect(i*w+3,c.height-30-h,w-6,h);
   g.fillStyle='#9aa3b2';g.font='10px sans-serif';g.fillText(m.module,i*w+6,c.height-12);});
  $('#t_mods').innerHTML='<tr><th>module</th><th>OTUs</th><th>var. expl.</th></tr>'+
-  mods.map(m=>`<tr><td>${m.module}</td><td>${m.size}</td><td>${fmt(m.var_explained,3)}</td></tr>`).join('');}
+  mods.map(m=>`<tr><td>${esc(m.module)}</td><td>${esc(m.size)}</td><td>${fmt(m.var_explained,3)}</td></tr>`).join('');}
 function axes(g,w,h,pad){g.strokeStyle='#2a2f3a';g.beginPath();g.moveTo(pad,h-pad);g.lineTo(w-8,h-pad);g.moveTo(pad,h-pad);g.lineTo(pad,8);g.stroke();}
 function rmtV(r){const s=r.rmt_scan,c=$('#c_rmt'),g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);
  if(!s.length){g.fillStyle='#9aa3b2';g.fillText('no scan (fixed --st run)',20,40);return;}

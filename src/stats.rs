@@ -212,7 +212,8 @@ mod tests {
     #[test]
     fn poisson_gof_accepts_poisson_samples_rejects_clustered() {
         // exponential spacings = Poisson process inter-arrivals
-        let mut rng = rand::thread_rng();
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         use rand::Rng;
         let mut d: Vec<f64> = (0..2000).map(|_| -rng.gen::<f64>().max(1e-12).ln()).collect();
         let m = d.iter().sum::<f64>() / d.len() as f64;
