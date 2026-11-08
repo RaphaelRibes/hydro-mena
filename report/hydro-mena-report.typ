@@ -32,7 +32,7 @@
   ]
   #v(0.3em)
   #text(size: 9pt)[
-    Commit `3e780b0` · 2026-11-08 · bench on `cachyos-x8664` (Ryzen 7 5800X3D, RTX 2080 Ti)
+    Commit `85dc991` · 2026-11-08 · bench on `cachyos-x8664` (Ryzen 7 5800X3D, RTX 2080 Ti)
   ]
 ]
 
@@ -193,6 +193,7 @@ misquoted it:
 - *Step (c)*: "Set an initial threshold value, $s_t$ (e.g., 0.3 based on our experiences)."
 - *Step (f)*: unfolding by "fitting the original integrated density to a cubic spline or by local density average".
 - *Step (h)*: χ² GOF, $H_0$: Poisson $exp(-d)$, at "a significant level of 0.01".
+  An earlier build used 0.05 from a misquote; that was a regression and has been reverted.
 
 == What the 2025 internship code did
 
