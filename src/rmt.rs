@@ -32,11 +32,17 @@ pub struct RmtConfig {
     pub min_spacings: usize,
     /// minimum dof for a point to count as estimable
     pub min_dof: usize,
+    /// minimum share of OTUs that must survive the threshold. 0.5 is the point
+    /// below which the calibration pilot showed ARI collapsing (< 0.35), so a
+    /// sparser graph is not a usable estimate of community structure.
+    pub min_kept_frac: f64,
+    /// minimum share of kept nodes inside the giant component
+    pub min_giant_frac: f64,
 }
 
 impl Default for RmtConfig {
     fn default() -> Self {
-        Self { giant: true, trim_extremes: true, min_spacings: 20, min_dof: 2 }
+        Self { giant: true, trim_extremes: true, min_spacings: 20, min_dof: 2, min_kept_frac: 0.5, min_giant_frac: 0.5 }
     }
 }
 
@@ -198,35 +204,42 @@ fn polyval(coef: &[f64], x: f64) -> f64 {
 
 /// Unfold a sorted spectrum: spacings of the fitted integrated density,
 /// normalised to unit mean. Returns (spacings, unfolded positions).
+/// Unfold the spectrum by **local density average** (paper step (f): "fitting
+/// the original integrated density to a cubic spline or by local density
+/// average").
+///
+/// For each eigenvalue, estimate the local mean spacing from a symmetric window
+/// of w neighbours and integrate dλ/ρ(λ). This is positive by construction, so
+/// there is no monotone clipping and therefore no plateau of zero spacings —
+/// the previous degree-5 polynomial plus clipping produced exactly that, and it
+/// was the real cause of every `excluded_too_few_spacings` in the audit trail.
 fn unfolded_spacings(lam_in: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let mut sorted: Vec<f64> = lam_in.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let lam_sorted: &[f64] = &sorted;
-    let p = lam_sorted.len();
+    let lam = &sorted;
+    let p = lam.len();
     if p < 6 {
-        return (Vec::new(), lam_sorted.to_vec());
+        return (Vec::new(), lam.clone());
     }
-    let rank: Vec<f64> = (0..p).map(|i| i as f64 + 1.0).collect();
-    let degree = 5.min(p / 5).max(1);
-    let coef = polyfit(lam_sorted, &rank, degree);
-    let mut xi: Vec<f64> = lam_sorted.iter().map(|&l| polyval(&coef, l)).collect();
-    // A polynomial integrated density is not guaranteed monotone, and a
-    // non-monotone N(lambda) is not a valid unfolding: it yields negative
-    // spacings, which the GOF would then silently drop from the observed counts
-    // while still expecting them. Enforce monotonicity, then reject the
-    // unfolding outright if any spacing is still non-positive.
-    for i in 1..xi.len() {
-        if xi[i] < xi[i - 1] {
+    let w = (p / 40).max(2).min((p / 4).max(2));
+    let mut xi = vec![0.0f64; p];
+    for i in 1..p {
+        let lo = i.saturating_sub(w);
+        let hi = (i + w).min(p - 1);
+        let span = (lam[hi] - lam[lo]).abs();
+        let local = span / (hi - lo).max(1) as f64;
+        if local > 0.0 && local.is_finite() {
+            xi[i] = xi[i - 1] + (lam[i] - lam[i - 1]) / local;
+        } else {
+            // repeated eigenvalue: no resolvable level spacing here
             xi[i] = xi[i - 1];
         }
     }
-    let raw: Vec<f64> = (0..p - 1).map(|i| xi[i + 1] - xi[i]).collect();
-    let mean = raw.iter().sum::<f64>() / raw.len() as f64;
-    if !(mean > 0.0) || raw.iter().any(|&v| v <= 0.0) {
-        // degenerate spectrum (e.g. many repeated eigenvalues in a 0/1 adjacency)
+    let mut d: Vec<f64> = (0..p - 1).map(|i| xi[i + 1] - xi[i]).collect();
+    let mean = d.iter().sum::<f64>() / d.len() as f64;
+    if !(mean > 0.0) {
         return (Vec::new(), xi);
     }
-    let mut d = raw;
     for v in d.iter_mut() {
         *v /= mean;
     }
@@ -234,12 +247,8 @@ fn unfolded_spacings(lam_in: &[f64]) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// Largest connected component of the binary graph over `keep`, as positions
-/// into `keep`, plus its fraction of all kept nodes.
-///
-/// A disconnected graph is Poisson-like for free (independent spectra
-/// superpose to Poisson), so testing a fragmented graph measures fragmentation,
-/// not modular structure. The spectral test is therefore run on the giant
-/// component and `giant_frac` is reported with every scan point.
+/// into `keep`, plus its fraction of all kept nodes. A disconnected graph is
+/// Poisson-like for free, so the spectral test is run on the giant component.
 fn giant_component(a: &Mat, keep: &[usize]) -> (Vec<usize>, f64) {
     let p = keep.len();
     let mut comp = vec![usize::MAX; p];
@@ -289,7 +298,7 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
         giant_frac,
         status: reason.to_string(),
     };
-    if p < min_nodes.max(6) {
+    if p < min_nodes.max(6) || (p as f64) < cfg.min_kept_frac * s.nrows() as f64 {
         return ex(p, edges, "excluded_min_nodes", f64::NAN);
     }
     let (giant, giant_frac) = if cfg.giant {
@@ -297,7 +306,7 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
     } else {
         ((0..keep.len()).collect::<Vec<usize>>(), 1.0)
     };
-    if giant.len() < min_nodes.max(6) {
+    if giant.len() < min_nodes.max(6) || giant_frac < cfg.min_giant_frac {
         return ex(p, edges, "excluded_tiny_giant", giant_frac);
     }
     let g = giant.len();

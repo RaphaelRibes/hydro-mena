@@ -165,6 +165,7 @@ fn main() -> Result<()> {
                     trim_extremes: !no_trim,
                     min_spacings,
                     min_dof,
+                    ..Default::default()
                 },
                 abundance_path: abundance.display().to_string(),
                 traits_path: traits.display().to_string(),
