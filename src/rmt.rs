@@ -483,7 +483,7 @@ mod tests {
         for i in 0..n {
             full[(i, i)] = 0.0;
         }
-        match evaluate(&full, 0.5, 10, 0.01) {
+        match evaluate(&full, 0.5, 10, 0.01, &RmtConfig::default()) {
             Some(pt) => assert!(!pt.poisson, "complete graph must not look Poisson: {pt:?}"),
             None => {} // a degenerate spectrum may not even be evaluable
         }
@@ -506,7 +506,7 @@ mod tests {
                 s[(j, i)] = v;
             }
         }
-        let pt = evaluate(&s, 0.5, 10, 0.01).expect("dense graph should be evaluable");
+        let pt = evaluate(&s, 0.5, 10, 0.01, &RmtConfig::default()).expect("dense graph should be evaluable");
         assert!(pt.p > 10, "kept {} nodes", pt.p);
         assert!(pt.chi2.is_finite() && pt.dof >= 1, "{pt:?}");
     }
