@@ -283,6 +283,30 @@ spacing set entirely, which means those two choices are load-bearing for
 producing a statistic at all on this data. That is a limitation to state, not a
 defect to hide: the unfolding is fragile at $n approx 170$ with 12 to 36 samples.
 
+== Literature anchors (verified via Europe PMC, 2026-11-08)
+
+Searches for a dedicated critique of RMT threshold selection in MENA returned
+very little: the two hits are *tool papers*, not methodological critiques. That
+absence is itself a finding — the criterion is used largely by inheritance.
+
++ Peng X, Feng K, Yang X, He Q, Zhao B, Li T, Wang S, *Deng Y.* (2024).
+  iNAP 2.0: harnessing metabolic complementarity in microbial network analysis.
+  *iMeta* 3:e235. doi:10.1002/imt2.235 — the original authors' successor
+  implementation; the reference point any re-implementation should be checked
+  against.
++ Zhou M, Xu Y, Zhu K *et al.* (2025). Spatial-temporal pattern of RMT network
+  stability in an estuarine phytoplankton community. *J Environ Manage*.
+  doi:10.1016/j.jenvman.2025.126873 — uses the RMT threshold as a stability
+  diagnostic rather than a selector, which is close to the position argued here.
++ Méndez-Bermúdez J A *et al.* (2015). Universality in the spectral and
+  eigenfunction properties of random networks. *Phys Rev E* 91:032122 —
+  supports treating spacing statistics as a continuous family rather than a
+  binary Poisson/GOE verdict.
+
+The Brody distribution is standard in quantum-chaos spectroscopy (e.g. Manos and
+Robnik 2013, *Phys Rev E* 87:062905) but is not established practice in MENA;
+Layer 2 is therefore proposed as an addition, not as a reproduction of anything.
+
 = Results on the real data (exploratory)
 
 Fixed threshold 0.52 for comparability with the 2025 work, 999 permutations.
