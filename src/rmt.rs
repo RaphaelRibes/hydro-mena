@@ -2,22 +2,46 @@
 //!
 //! a-b  similarity S = |Pearson r|
 //! c-d  adjacency A_ij = 1 when S_ij >= st, zero diagonal, drop degree-0 nodes
-//! e-f  eigenvalues of A
-//! g-i  unfold the spectrum: fit the integrated density N(lambda) with a
-//!      low-order polynomial and take the spacings of N at consecutive
-//!      eigenvalues, rescaled to unit mean
-//! j-k  chi^2 goodness-of-fit of the spacing histogram against the Poisson
-//!      law exp(-s) at alpha = 0.01
+//! e    eigen-decompose the *weighted* thresholded similarity matrix of the
+//!      giant component (paper Eq. 3: keep the weights s_ij, zero the
+//!      sub-threshold entries, zero diagonal — binarising gives repeated
+//!      eigenvalues and nothing for the spacing test to resolve)
+//! f    unfold by **local density average**: estimate the local mean spacing
+//!      from a symmetric window of neighbours and integrate dλ/ρ(λ). This is
+//!      positive by construction, so there is no polynomial fit and no clipping
+//! g-i  spacings rescaled to unit mean
+//! j-k  binned chi^2 goodness-of-fit of the spacing histogram against the
+//!      Poisson law exp(-s) at alpha
+//! l    continuous diagnostics alongside the binary verdict: the MLE Brody
+//!      exponent (0 = Poisson, 1 = GOE) and the KS distance to the Wigner
+//!      surmise, so a near-miss is readable as a number instead of "rejected".
+//!      Above 512 giant-component nodes the scan takes the spectrum from
+//!      Lanczos (full reorthogonalisation) instead of the dense O(n^3) solver.
 //!
-//! The previous version derived "unfolded" spacings from the rank alone
-//! (e_i = (i+0.5)/p, d_i = p*(e_{i+1}-e_i) = 1 for every i), so the statistic
-//! collapsed to chi^2 = 0 for every graph and the *first* candidate threshold
-//! always "converged" — with a start of 0.01 that returned the complete graph
-//! (M ~ 0.01, gamma ~ -42). Unfolding now uses the actual eigenvalue density
-//! and the GOF is a real binned chi-square.
+//! Every candidate threshold is reported with a status (`accepted`,
+//! `rejected_gof`, `excluded_*`). A point is only eligible when the graph keeps
+//! at least `min_kept_frac` of the OTUs and at least `min_giant_frac` of the
+//! kept nodes fall in the giant component; both floors are 0.5, the point below
+//! which the calibration pilot showed modularity recovery collapsing. When no
+//! candidate passes the GOF the result is *not estimable*: st is NaN and no
+//! adjacency is built — only the audit trail (one row per candidate) is
+//! written, so a failure can be diagnosed instead of being papered over with a
+//! fallback graph.
 use crate::linalg::{self, Mat};
 use crate::stats;
 use rayon::prelude::*;
+
+/// Giant components larger than this are eigen-decomposed with Lanczos instead
+/// of the dense solver: above a few hundred nodes the O(n^3) decomposition is
+/// the entire runtime of the pipeline, while the spacing GOF only needs a
+/// representative stretch of eigenvalues.
+const LANCZOS_MIN_N: usize = 512;
+
+/// Number of Lanczos steps for an n x n matrix: enough to converge the extremal
+/// Ritz values well past the 5th, capped so the cost stays O(60 n^2).
+fn lanczos_steps(n: usize) -> usize {
+    n.saturating_sub(2).clamp(2, 60)
+}
 
 /// Every post-hoc choice in the spectral test, as a toggle. These were
 /// introduced while looking at real-data output, so each must be ablable: a
@@ -38,11 +62,22 @@ pub struct RmtConfig {
     pub min_kept_frac: f64,
     /// minimum share of kept nodes inside the giant component
     pub min_giant_frac: f64,
+    /// seed for the Lanczos start vector (only used above `LANCZOS_MIN_N`);
+    /// fixed so a scan is reproducible
+    pub seed: u64,
 }
 
 impl Default for RmtConfig {
     fn default() -> Self {
-        Self { giant: true, trim_extremes: true, min_spacings: 20, min_dof: 2, min_kept_frac: 0.5, min_giant_frac: 0.5 }
+        Self {
+            giant: true,
+            trim_extremes: true,
+            min_spacings: 20,
+            min_dof: 2,
+            min_kept_frac: 0.5,
+            min_giant_frac: 0.5,
+            seed: 42,
+        }
     }
 }
 
@@ -59,6 +94,13 @@ pub struct ScanPoint {
     pub poisson: bool,
     /// Kolmogorov-Smirnov distance to the Poisson CDF (secondary diagnostic)
     pub ks: f64,
+    /// MLE Brody exponent of the spacings: 0 = Poisson, 1 = GOE. Continuous
+    /// version of the accept/reject verdict (NaN when there are no spacings).
+    pub brody_beta: f64,
+    /// Kolmogorov-Smirnov distance to the Wigner surmise (GOE). Read against
+    /// `ks`: the smaller one names the ensemble the spacing distribution
+    /// actually resembles (NaN when there are no spacings).
+    pub ks_goe: f64,
     /// share of kept nodes inside the giant component the test was run on
     pub giant_frac: f64,
     /// why this candidate was accepted or dropped: `accepted`, `rejected_gof`,
@@ -69,6 +111,13 @@ pub struct ScanPoint {
 }
 
 /// Symmetric 0/1 adjacency from the similarity matrix at threshold `st`.
+///
+/// Requires `s >= 0` in the entries that matter: the similarity handed in is
+/// always |r|. `--signed` keeps the sign of r elsewhere (edge metadata and
+/// `similarity.csv`), not here: Deng Eq. 3 and the Poisson spacing GOF assume
+/// non-negative weights, so a negative entry would be silently thresholded as
+/// if it were its absolute value anyway — better to make the abs explicit in
+/// the caller than to leave a threshold rule that reads as a bug.
 pub fn adjacency(s: &Mat, st: f64) -> Mat {
     let n = s.nrows();
     let mut a = Mat::zeros((n, n));
@@ -107,6 +156,9 @@ fn edges_of(a: &Mat) -> usize {
 /// Least-squares polynomial fit, normal equations with partial pivoting.
 /// `x` is rescaled to [-1, 1] first so the Vandermonde system stays conditioned.
 /// Returns coefficients in ascending power order.
+/// Only used by `polyfit_recovers_a_line`; the scan itself now unfolds by local
+/// density average, so this is test-only code.
+#[cfg(test)]
 fn polyfit(x: &[f64], y: &[f64], degree: usize) -> Vec<f64> {
     let d = degree + 1;
     let (lo, hi) = x
@@ -194,6 +246,7 @@ fn polyfit(x: &[f64], y: &[f64], degree: usize) -> Vec<f64> {
     out
 }
 
+#[cfg(test)]
 fn polyval(coef: &[f64], x: f64) -> f64 {
     let mut acc = 0.0;
     for &c in coef.iter().rev() {
@@ -202,8 +255,6 @@ fn polyval(coef: &[f64], x: f64) -> f64 {
     acc
 }
 
-/// Unfold a sorted spectrum: spacings of the fitted integrated density,
-/// normalised to unit mean. Returns (spacings, unfolded positions).
 /// Unfold the spectrum by **local density average** (paper step (f): "fitting
 /// the original integrated density to a cubic spline or by local density
 /// average").
@@ -244,6 +295,109 @@ fn unfolded_spacings(lam_in: &[f64]) -> (Vec<f64>, Vec<f64>) {
         *v /= mean;
     }
     (d, xi)
+}
+
+/// Eigenvalues of the largest (and smallest) part of the spectrum by Lanczos
+/// iteration with **full reorthogonalisation**, in ascending order.
+///
+/// Used by the scan above `LANCZOS_MIN_N` nodes, where the dense O(n^3)
+/// decomposition dominates the pipeline. `k` steps cost O(k n^2) mat-vecs and
+/// converge the extremal Ritz values; the returned set is the *upper* part of
+/// the spectrum, not all n eigenvalues, so a spacing test run on it reads the
+/// well-resolved tail rather than the bulk. That is an approximation and is
+/// documented as one: below the cutoff the dense solver is used, and the scan
+/// point is reported with the same guards either way.
+///
+/// Full reorthogonalisation (twice, against every previous basis vector) is
+/// what keeps the Ritz values accurate to ~1e-10 instead of degrading to the
+/// classic three-term recurrence's ghost-eigenvalue behaviour.
+fn lanczos_eigvals(w: &Mat, k: usize, seed: u64) -> Vec<f64> {
+    use rand::{Rng, SeedableRng};
+    let n = w.nrows();
+    if n < 2 || w.ncols() != n {
+        return Vec::new();
+    }
+    let m = k.clamp(1, n);
+    let ws = w.as_slice().expect("row-major matrix");
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut q_cur: Vec<f64> = (0..n).map(|_| rng.gen::<f64>() - 0.5).collect();
+    let mut nq = q_cur.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if !(nq > 0.0) || !nq.is_finite() {
+        // degenerate draw: fall back to a coordinate vector
+        q_cur.iter_mut().for_each(|v| *v = 0.0);
+        q_cur[0] = 1.0;
+        nq = 1.0;
+    }
+    for v in q_cur.iter_mut() {
+        *v /= nq;
+    }
+
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let norm = |a: &[f64]| dot(a, a).sqrt();
+
+    let mut basis: Vec<Vec<f64>> = vec![q_cur.clone()];
+    // The Rayleigh quotient Q^T A Q, accumulated from the reorthogonalisation
+    // coefficients: with full reorthogonalisation this is the exact projection
+    // onto the computed subspace, so its eigenvalues (Ritz values) are optimal
+    // there. Keeping only the three-term (tridiagonal) entries would discard
+    // the corrections that make the basis orthonormal in finite precision.
+    let mut t = Mat::zeros((m, m));
+    let mut used = 0usize;
+    let mut scale = 1.0f64;
+
+    for step in 0..m {
+        // z = A q_j. The three-term recurrence's beta_{j-1} q_{j-1} term is
+        // not subtracted explicitly: q_{j-1} is in `basis`, so the
+        // reorthogonalisation below removes that component anyway.
+        let mut z = vec![0.0f64; n];
+        for i in 0..n {
+            let row = &ws[i * n..(i + 1) * n];
+            let mut acc = 0.0;
+            for j in 0..n {
+                acc += row[j] * q_cur[j];
+            }
+            z[i] = acc;
+        }
+        let a = dot(&q_cur, &z);
+        for i in 0..n {
+            z[i] -= a * q_cur[i];
+        }
+        t[(step, step)] = a;
+        // full reorthogonalisation, two passes (the second catches the loss of
+        // orthogonality the first pass itself introduces); each coefficient is
+        // the corresponding entry of Q^T A Q
+        for _pass in 0..2 {
+            for (i, v) in basis.iter().enumerate() {
+                let c = dot(v, &z);
+                if c != 0.0 {
+                    t[(i, step)] += c;
+                    t[(step, i)] += c;
+                    for k in 0..n {
+                        z[k] -= c * v[k];
+                    }
+                }
+            }
+        }
+        used = step + 1;
+        if step == 0 {
+            scale = a.abs().max(1.0);
+        }
+        let b = norm(&z);
+        if step + 1 == m || b <= 1e-12 * scale {
+            break;
+        }
+        for i in 0..n {
+            z[i] /= b;
+        }
+        q_cur = z;
+        basis.push(q_cur.clone());
+    }
+
+    if used == 0 {
+        return Vec::new();
+    }
+    let t = t.slice(ndarray::s![..used, ..used]).to_owned();
+    linalg::eigh(&t).0
 }
 
 /// Largest connected component of the binary graph over `keep`, as positions
@@ -295,6 +449,8 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
         crit: f64::NAN,
         poisson: false,
         ks: f64::NAN,
+        brody_beta: f64::NAN,
+        ks_goe: f64::NAN,
         giant_frac,
         status: reason.to_string(),
     };
@@ -321,7 +477,18 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
             }
         }
     }
-    let (mut lam, _) = linalg::eigh(&w);
+    let mut lam = if g > LANCZOS_MIN_N {
+        // The dense O(g^3) decomposition is the whole runtime of the pipeline
+        // at this size; the spacing GOF needs a stretch of eigenvalues, not all
+        // of them. Seed per threshold so a rescan is reproducible.
+        let seed = cfg.seed ^ (st * 1e6).round() as u64;
+        lanczos_eigvals(&w, lanczos_steps(g), seed)
+    } else {
+        linalg::eigh(&w).0
+    };
+    if lam.len() < 2 {
+        return ex(p, edges, "excluded_too_few_spacings", giant_frac);
+    }
     if cfg.trim_extremes && lam.len() > 10 {
         lam.pop();
         lam.remove(0);
@@ -332,6 +499,10 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
     }
     let (chi2, dof, crit) = stats::poisson_gof(&d, alpha);
     let ks = stats::ks_poisson(&d);
+    // continuous diagnostics, reported for every point that has spacings --
+    // they are what makes a near-miss legible instead of just "rejected"
+    let brody_beta = stats::brody_beta(&d);
+    let ks_goe = stats::ks_goe(&d);
     let mut pt = ScanPoint {
         st,
         p,
@@ -341,6 +512,8 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
         crit,
         poisson: false,
         ks,
+        brody_beta,
+        ks_goe,
         giant_frac,
         status: String::new(),
     };
@@ -463,6 +636,9 @@ pub fn at_threshold(s: &Mat, st: f64) -> RmtResult {
                 }
             }
         }
+        // Dense even above LANCZOS_MIN_N: this path produces the spectrum that
+        // spectrum.csv and the RMT figure are drawn from, so it stays exact.
+        // The Lanczos approximation is confined to the scan decision.
         let (lam, _) = linalg::eigh(&w);
         let (d, _) = unfolded_spacings(&lam);
         eigenvalues = lam;
@@ -545,5 +721,113 @@ mod tests {
         // it must at least reach the statistic, even if the dof guard then drops it
         assert_ne!(pt.status, "excluded_min_nodes", "{pt:?}");
         assert_ne!(pt.status, "excluded_too_few_spacings", "{pt:?}");
+        // and the continuous diagnostics must be filled, not left at zero/NaN
+        assert!(pt.brody_beta.is_finite() && pt.ks_goe.is_finite(), "{pt:?}");
+        assert!((0.0..=2.0).contains(&pt.brody_beta), "{pt:?}");
+        // excluded points have no spectrum, so they must say NaN, not 0
+        let none = evaluate(&s, 0.999, 10, 0.01, &RmtConfig::default());
+        assert_eq!(none.status, "excluded_min_nodes", "{none:?}");
+        assert!(none.brody_beta.is_nan() && none.ks_goe.is_nan(), "{none:?}");
+    }
+
+    #[test]
+    fn lanczos_matches_eigh_on_the_extremal_spectrum() {
+        // Random symmetric 600x600 with the spectral structure the scan
+        // actually sees: a few separated signal eigenvalues over a noise bulk
+        // (a spiked model -- modules plus noise). Extremal Lanczos convergence
+        // is governed by the relative gap, so 60 steps reproduce these to
+        // machine precision.
+        //
+        // A *dense* U(-1,1) matrix would be a worse test, not a harder one:
+        // its top five eigenvalues are pairwise as close as 0.07 on a spectral
+        // width of 56, so no 60-step Lanczos reaches 1e-6 there (measured:
+        // 1e-4 for the 3rd/4th). That regime is covered by the top-1 check
+        // below, which is the accuracy that case can honestly support.
+        let n = 600;
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2024);
+        let mut u = vec![vec![0.0f64; n]; 5];
+        for r in 0..5 {
+            let mut nrm = 0.0;
+            for i in 0..n {
+                let v: f64 = rng.gen::<f64>() * 2.0 - 1.0;
+                u[r][i] = v;
+                nrm += v * v;
+            }
+            let nrm = nrm.sqrt();
+            for i in 0..n {
+                u[r][i] /= nrm;
+            }
+        }
+        let amp = [10.0, 7.0, 5.0, 3.5, 2.5];
+        let mut a = Mat::zeros((n, n));
+        for i in 0..n {
+            for j in i..n {
+                let mut acc = 0.0;
+                for r in 0..5 {
+                    acc += amp[r] * u[r][i] * u[r][j];
+                }
+                if i != j {
+                    acc += 0.01 * (rng.gen::<f64>() * 2.0 - 1.0);
+                }
+                a[(i, j)] = acc;
+                a[(j, i)] = acc;
+            }
+        }
+
+        let (full, _) = linalg::eigh(&a);
+        let mut ritz = lanczos_eigvals(&a, lanczos_steps(n), 7);
+        assert_eq!(lanczos_steps(n), 60);
+        assert_eq!(ritz.len(), 60, "expected 60 Ritz values");
+        ritz.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        for t in 0..5 {
+            let want = full[n - 1 - t];
+            let got = ritz[ritz.len() - 1 - t];
+            let rel = (got - want).abs() / want.abs().max(1.0);
+            assert!(rel < 1e-6, "Ritz[{t}] = {got}, eigh = {want}, rel = {rel:e}");
+        }
+
+        // dense U(-1,1): only the leading (well-separated) Ritz value can be
+        // demanded at this step count
+        let mut b = Mat::zeros((n, n));
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let v = rng.gen::<f64>() * 2.0 - 1.0;
+                b[(i, j)] = v;
+                b[(j, i)] = v;
+            }
+        }
+        let (full, _) = linalg::eigh(&b);
+        let mut ritz = lanczos_eigvals(&b, lanczos_steps(n), 7);
+        ritz.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let want = full[n - 1];
+        let got = ritz[ritz.len() - 1];
+        assert!((got - want).abs() / want.abs() < 1e-6, "top Ritz {got} vs eigh {want}");
+    }
+
+    #[test]
+    fn large_graph_takes_the_lanczos_path_and_stays_estimable() {
+        // A 560-node block graph is above the cutoff, so evaluate() must route
+        // through Lanczos and still produce a finite point with diagnostics.
+        let n = 560;
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut s = Mat::zeros((n, n));
+        let block = 40;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let same = i / block == j / block;
+                let p = if same { 0.6 } else { 0.005 };
+                let v = if rng.gen::<f64>() < p { 0.8 } else { 0.1 };
+                s[(i, j)] = v;
+                s[(j, i)] = v;
+            }
+        }
+        let pt = evaluate(&s, 0.5, 10, 0.01, &RmtConfig::default());
+        assert!(pt.p > 500, "kept {} nodes", pt.p);
+        assert_ne!(pt.status, "excluded_too_few_spacings", "{pt:?}");
+        assert!(pt.brody_beta.is_finite() && pt.ks_goe.is_finite(), "{pt:?}");
     }
 }

@@ -8,6 +8,7 @@ pub mod linalg;
 pub mod stats;
 pub mod rmt;
 pub mod network;
+pub mod nullmodel;
 pub mod modules;
 pub mod eigengene;
 pub mod traits;

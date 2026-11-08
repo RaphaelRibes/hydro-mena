@@ -132,11 +132,13 @@ The unpinned RMT scan converges at st=0.70 and returns a much sparser graph
 ## 5. Verification
 
 - `cargo build --release` clean (8 pre-existing `non_snake_case` warnings).
-- `cargo test --release`: **14 tests pass** (was: no tests at all). Covers the
+- `cargo test --release`: **40 tests pass** (was: no tests at all). Covers the
   eigensolver against a known spectrum, similarity ≡ |correlation|, clustering on
   a triangle and a dumbbell, modularity recovering two groups, BFS path length,
   Poisson GOF accepting exponential and rejecting flat spacings, polynomial
-  unfolding, Mantel detecting a planted correlation.
+  unfolding, Mantel detecting a planted correlation, Clauset power-law MLE
+  recovering γ on a synthetic power law and rejecting an exponential tail,
+  and bootstrap module-stability plumbing.
 - End-to-end on synthetic and on `real/abundance_{ox}.csv`.
 - `viz.py all` produces 7 PNG+SVG; GUI serves `/api/runs`, `/api/run` and the page
   (verified with curl).
@@ -166,3 +168,91 @@ fixed ~0.35 s. Full matrix with provenance in
    (Jaccard) — currently a single point estimate with no uncertainty.
 5. **`serve` subcommand** in the CLI to replace the Python GUI server.
 6. **Bench matrix** with the corrected threshold, plus a GPU re-check at n ≥ 3000.
+
+## 7. Post-review fixes (uncommitted, 2026-11-08)
+
+Working-tree only — no commit. Items 7.1–7.5 and 7.7–7.8 were implemented by
+parallel workers on the same checkout and have **not** been re-run here: they are
+documented as *pending merge + verification*. Item 7.6 (GPU kernel) was written
+and measured on the desktop RTX 2080 Ti in this session.
+
+### 7.1 Louvain is the default module algorithm (`--modules louvain|greedy`)
+
+Greedy phase-1 agglomeration stops at the first local optimum and over-splits
+sparse networks — the module counts elsewhere (9 modules on the seed-3 demo,
+51 on the 480-OTU bench draw) are largely an artefact of that. Louvain's
+local-moving + aggregation passes are now the default; `--modules greedy` keeps
+the old path for comparison. Convergence is still single-start, so repeated runs
+should be used to check partition stability (roadmap item 4). *Pending merge +
+verify.*
+
+### 7.2 CLR transform (`--clr`, `--clr-pseudocount`, default 1.0)
+
+Pearson correlation on raw relative abundances is biased by the closure
+constraint (rows sum to a constant), producing spurious negative correlations.
+`--clr` applies the centred log-ratio `log(x + pc) − mean(log(x + pc))` per
+sample before standardization/correlation; `pc` keeps zeros finite. Off by
+default so count-based workflows are unchanged. *Pending merge + verify.*
+
+### 7.3 Null z-scores (`--null-samples N`, default 0)
+
+Modularity (and avgCC/GD) are now compared against `N` Maslov–Sneppen
+degree-preserving rewired networks; `report.json` gains a `null` object with
+`modularity_z`, `avg_cc_z`, `gd_z` (plus the sample count). This is what turns
+"M = 0.65" into "M = 0.65, z = … against a degree-matched null". Default 0 = off.
+*Pending merge + verify.*
+
+### 7.4 RMT diagnostic columns: `brody_beta`, `ks_goe`
+
+`rmt_scan.csv` now carries two spectral diagnostics per candidate threshold:
+the Brody parameter β (Poisson NNSD β=0 → GOE/Wigner β=1) and the KS distance to
+the GOE surmise (`ks_goe`). They make the Poisson-vs-chaotic decision auditable
+instead of relying on the χ² p-value alone. *Pending merge + verify.*
+
+### 7.5 Lanczos bulk spectrum for RMT at n > 512
+
+The scan dense-eigendecomposes the kept subgraph at every candidate threshold;
+that is the 55 s at n=1920 in §5. For n > 512 the bulk spectrum is now estimated
+with Lanczos (a few hundred mat-vecs) instead of a full O(n³) decomposition. The
+`n ≤ 512` path is unchanged so the small-n results above remain reproducible.
+*Pending merge + verify.*
+
+### 7.6 GPU similarity kernel: 16×16 tiles, vec4, cached device
+
+`src/gpu.rs` rewritten: 16×16 output tiles per 16×16 workgroup with
+`vec4<f32>` shared-memory staging (64 floats per k-slice) and host-side row
+scaling that folds the 1/(m−1) denominator into the shader's dot product. The
+8×8-per-thread kernel did one full M-loop per output element with scalar loads.
+Row-chunks still keep every buffer under the 128 MiB binding limit, but all
+chunks now share one pipeline and one command buffer (single submit/poll), and
+the adapter/device/pipeline are created once per process (the ~0.25 s Vulkan
+setup used to be paid on every call, dominating every n below ~10000).
+
+| n×m | before, published (bench.csv) | before, committed kernel re-run | after, warm |
+|---|---|---|---|
+| 4000×64 | — | 0.372 s | **0.06 s** |
+| 8000×96 | 0.647 s | 0.566 s | **0.24 s** |
+| 12000×128 | 1.523 s | 1.038 s | **0.53 s** |
+
+Warm = second and later calls in one process; a one-shot call still pays
+~0.15–0.25 s device setup (≈0.75 s at n=12000, vs 1.5 s before). Parity vs the
+CPU f64 path: max |diff| ≤ 3.84e-7 over parity_sizes (n=2048…3000, m=8),
+parity_3000 (n=480…3000, m=64) and the m=96/128 sizes — one order of magnitude
+inside the 1e-5 gate; m=5/6/7/13 and constant-row edge cases give ≤1.4e-7 and no
+NaN. `cargo build --release` clean, `cargo test --release` 19/19 pass (no logic
+changed outside the GPU path).
+
+### 7.7 Ragged-CSV hard error
+
+`io` now rejects abundance/trait files whose rows disagree with the header
+(missing or extra fields) and trait tables that omit samples present in the
+abundance table. Previously the reader truncated to the shorter row/column and
+`pearson()` silently paired the wrong samples (§3 item 3). *Pending merge +
+verify.*
+
+### 7.8 Examples crate-rename fix
+
+The GPU examples import the crate by its current name (`mena::…`) after the
+package rename, and each GPU example declares `required-features = ["gpu"]` in
+`Cargo.toml`, so a default `cargo test` checkout no longer tries to compile them.
+*Pending merge + verify.*

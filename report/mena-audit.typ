@@ -30,7 +30,7 @@
   ]
   #v(0.3em)
   #text(size: 9pt)[
-    Commit `abacc49` · 2026-11-08 · bench on `cachyos-x8664` (Ryzen 7 5800X3D, RTX 2080 Ti)
+    Commit `b095def` · 2026-11-08 · bench on `cachyos-x8664` (Ryzen 7 5800X3D, RTX 2080 Ti)
   ]
 ]
 
@@ -124,16 +124,19 @@ from *the guards rejected the data*. Section 7 is the story of that distinction.
   columns: (auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"),
   inset: 5pt,
-  [*quantity*], [*before*], [*after*],
-  [threshold st], [0.010], [0.500 – 0.600],
+  [*quantity*], [*before*], [*after (real box, auto st = 0.500)*],
+  [threshold st], [0.010], [0.500 (auto, box)],
   [nodes / edges], [200 / 19 500 (complete)], [149 / 758],
   [mean degree], [195.0], [10.2],
   [modularity M], [0.009], [0.591],
-  [power-law γ], [−42.4], [−1.9],
+  [power-law γ], [−42.4], [0.17 (R² = 0.02, no power law)],
   [node roles], [200 × "connector"], [mixed],
 )
-#figure.caption[200 simulated OTUs, default `run`. A γ of −42 and 100 % connectors
-  are the signature of a saturated graph feeding every later stage.]
+#figure.caption[The "before" column is a 200-OTU simulated run under the broken rank
+unfolding (saturated graph: γ = −42, 100 % connectors). The "after" column is the
+fixed build on the real box condition at its automatic threshold; on the same 200-OTU
+simulation the fixed build rejects every candidate as not estimable at these floors
+(9 of 10 seeds), which is itself the honest outcome.]
 
 == Modularity omitted the configuration term
 
@@ -154,7 +157,7 @@ reported modularity fell; `ox` went from 0.705 to 0.650.
   [4], [Jacobi eigensolver rescanned the matrix per rotation, 200 rotations total], [replaced by implicit QR],
   [5], [clustering O(k³), modularity O(n²) per move, serial O(n²m) similarity], [O(k²), O(E), parallel],
   [6], [benchmark ran a stale copy of the pipeline], [now calls `run_pipeline`],
-  [7], [`cargo test` broken on a default checkout by feature-gated examples], [fixed, 18 tests],
+  [7], [`cargo test` broken on a default checkout by feature-gated examples; stale `hydro_mena` imports in examples after the crate rename], [fixed, 19 tests],
   [8], [Fig-5 panel selected traits by significance, i.e. cherry-picking under multiplicity], [ranks by effect size],
   [9], [commits landed with a broken test build (twice)], [pre-commit build+test gate],
 )
@@ -172,20 +175,24 @@ Benchmarks run on the desktop over Tailscale, min-of-3, artifacts disabled.
 #table(
   columns: (auto, auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
-  [*n × m*], [*pipeline*], [*CPU similarity*], [*GPU similarity*],
-  [240 × 24], [0.043 s], [0.00017 s], [0.376 s],
-  [960 × 32], [1.22 s], [0.0018 s], [0.357 s],
-  [1920 × 48], [55.06 s], [0.0100 s], [0.382 s],
-  [12000 × 128], [—], [1.499 s], [1.523 s (0.98×)],
+  [*n × m*], [*pipeline*], [*CPU similarity*], [*GPU similarity (old kernel)*], [*GPU (new kernel, warm)*],
+  [240 × 24], [0.043 s], [0.00017 s], [0.376 s], [~0.05 s],
+  [960 × 32], [1.22 s], [0.0018 s], [0.357 s], [~0.06 s],
+  [1920 × 48], [55.06 s], [0.0100 s], [0.382 s], [~0.09 s],
+  [8000 × 96], [—], [—], [0.566 s], [0.24 s],
+  [12000 × 128], [—], [1.499 s], [1.038–1.523 s], [*0.53 s* (2.9× vs old warm)],
 )
 
-The inherited claim of a 4.71× GPU win at n = 12000 is obsolete because the CPU
-path was parallelised, not because the GPU regressed: the kernel still runs at
-roughly 1 % of f32 peak, so this is a statement about the WGSL kernel, not the
-hardware. The bottleneck also moved: at n = 1920 the RMT stage was 55.0 s of the
-55.06 s total. After the unfolding fix the three-condition real-data sweep runs in
-under a second, because unfolding is now linear rather than a badly conditioned
-polynomial fit.
+The inherited claim of a 4.71× GPU win at n = 12000 was obsolete because the CPU
+path was parallelised, not because the GPU regressed. The kernel itself was then
+also rewritten (16×16 tiles, `vec4` shared-memory staging, single submit, cached
+adapter/pipeline): warm GPU similarity at n = 12000 went from 1.04–1.52 s to
+*0.53 s* — now 2.8× faster than the CPU (1.499 s) — with parity preserved
+(maxdiff ≤ 3.8×10⁻⁷, `parity_3000` bad = 0). First call per process still pays
+~0.15–0.25 s of device init. The bottleneck on the CPU pipeline moved to the RMT
+stage: at n = 1920 it was 55.0 s of the 55.06 s total; for giant components above
+512 nodes the scan now uses a Lanczos bulk spectrum, which cut the RMT stage at
+n = 1200 from 12.76 s to *0.41 s* with an identical scan verdict.
 
 = The threshold problem
 
@@ -204,7 +211,8 @@ adj_matrix = [[value if value >= threshold else 0 for value in row] for row in s
 
 Weighted, diagonal zeroed, threshold passed in — the Fig. 5 script hardcodes 0.52.
 That code never ran an RMT scan, so comparing its output to "our RMT threshold"
-was a category error.
+was a category error. The auto-thresholds that now bracket 0.52 (box 0.500,
+anox 0.600) were chosen without reference to it.
 
 == Decision logic
 
@@ -320,7 +328,9 @@ community structure.
 
 #figure(
   image("fig_scan_audit.png", width: 100%),
-  caption: [The audit trail, one point per candidate. Above the dashed line χ²
+  caption: [The audit trail, one point per candidate (figure from the ox run;
+    the scan CSVs for all three conditions were regenerated and re-counted on
+    commit `b095def` and match the table below exactly). Above the dashed line χ²
     exceeds its critical value. Grey crosses were excluded before the test; red
     circles were tested and rejected; green circles passed.]
 )
@@ -333,36 +343,52 @@ community structure.
   [ox], [0], [8], [6], [14],
   [anox], [2], [10], [6], [18],
 )
+#figure.caption[Re-verified on commit `b095def` (seed 7): the counts reproduce
+exactly from `rmt_scan.csv`. Excluded = `excluded_min_nodes` + `excluded_tiny_giant`;
+anox's two acceptances are st = 0.600 and st = 0.650, first accepted wins.]
 
 #table(
-  columns: (auto, auto, auto, auto, auto, auto, auto),
+  columns: (auto, auto, auto, auto, auto, auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
-  [*condition*], [*st (auto)*], [*n / E*], [*M*], [*avg CC*], [*GD*], [*modules*],
-  [box], [0.500], [149 / 758], [0.591], [0.566], [3.07], [16],
-  [anox], [0.600], [159 / 611], [0.688], [0.653], [4.37], [22],
-  [ox], [not estimable], [—], [—], [—], [—], [—],
+  [*condition*], [*st (auto)*], [*n / E*], [*M*], [*avg CC*], [*GD*], [*modules (Louvain)*], [*Brody β*],
+  [box], [0.500], [149 / 758], [0.608], [0.566], [3.07], [10], [0.54],
+  [anox], [0.600], [159 / 611], [0.705], [0.653], [4.37], [14], [0.63],
+  [ox], [not estimable], [—], [—], [—], [—], [—], [0.92 @ st=0.52],
 )
 
 Two of three conditions now yield a threshold automatically, and they bracket the
 0.52 that the 2025 internship hardcoded by hand — independent corroboration of a
-choice made without reference to it.
+choice made without reference to it. Module counts and M above are from the new
+*Louvain* optimiser (the previous greedy table read 16 / 22 modules and
+M = 0.591 / 0.688); β is the Brody parameter at the accepted threshold
+(Poisson = 0, Wigner = 1).
 
-`ox` is a different kind of result: eight candidates were tested and rejected. Its
-spacing distribution does not reach Poisson within the eligible range. That is now
-a scientific statement, because the test actually ran.
+`ox` is a different kind of result: eight candidates were tested and rejected.
+Its spacing distribution never reaches Poisson within the eligible range — and
+the new continuous diagnostics say why: at st = 0.52 the weighted spectrum has
+*β = 0.92*, i.e. it is essentially Wigner (KS to GOE 0.082 vs KS to Poisson
+0.204). The graph at 0.52 still carries strong spectral repulsion; no threshold
+in the eligible range randomises it enough. That is now a quantitative statement,
+not a Boolean dead end.
+
+Null z-scores (Maslov–Sneppen degree-preserving rewiring, b = 100, seed 7) at
+st = 0.52: box Q z = 21.7, ox Q z = 36.5, anox Q z = 32.9 (avg CC z = 89–116,
+GD z = 54–79 across the three). The observed modularity is 20–37 null standard
+deviations above the degree-matched ensemble — "M ≈ 0.6 is high" is now a
+measured claim, not an adjective.
 
 = Results at a fixed threshold
 
 Fixed 0.52 for comparability with the 2025 work, 999 permutations. These are the
-reproduction numbers; they are not the automatic path.
+reproduction numbers; they are not the automatic path. Louvain modules.
 
 #table(
-  columns: (auto, auto, auto, auto, auto, auto, auto),
+  columns: (auto, auto, auto, auto, auto, auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
-  [*condition*], [*n / E*], [*M*], [*avg CC*], [*GD*], [*modules*], [*Mantel r (p)*],
-  [box], [149 / 694], [0.631], [0.561], [3.22], [15], [0.173 (0.005)],
-  [ox], [166 / 836], [0.650], [0.640], [3.77], [20], [0.125 (0.017)],
-  [anox], [165 / 850], [0.583], [0.628], [3.63], [17], [0.077 (0.086)],
+  [*condition*], [*n / E*], [*M*], [*avg CC*], [*GD*], [*modules*], [*Mantel r (p)*], [*Q z (null)*],
+  [box], [149 / 694], [0.639], [0.561], [3.22], [10], [0.173 (0.01)], [21.7],
+  [ox], [166 / 836], [0.662], [0.640], [3.77], [13], [0.125 (0.04)], [36.5],
+  [anox], [165 / 850], [0.596], [0.628], [3.63], [11], [0.077 (0.09)], [32.9],
 )
 
 #figure(
@@ -385,40 +411,72 @@ reproduction numbers; they are not the automatic path.
   figure(image("fig_spectrum_ox.png", width: 100%), caption: [Adjacency spectrum and nearest-neighbour spacings against Poisson and Wigner.]),
 )
 
+= What was added after the audit (2026-11-08, working tree, uncommitted)
+
+The §9 gaps below were closed in the same working tree: Louvain is the default
+module optimiser (`--modules louvain|greedy`; box at st = 0.52: 15 → 10 modules,
+Q 0.631 → 0.639), `--clr [--clr-pseudocount]` adds the centred log-ratio transform
+(box at st = 0.52: M 0.639 → 0.630, E 694 → 690), `--null-samples N` writes
+degree-preserving null z-scores into `report.json`, the RMT scan CSV gains
+`brody_beta` and `ks_goe` (ox at st = 0.52: β = 0.92 — Wigner-like, which is why Poisson
+is never accepted), the scan uses a Lanczos bulk spectrum above 512 nodes
+(RMT stage at n = 1200: 12.76 s → 0.41 s), and the wgpu kernel was rewritten
+(16×16 tiles, `vec4` staging: n = 12000 warm 1.52 s → 0.53 s, 2.8× faster than
+CPU, parity maxdiff ≤ 3.8×10⁻⁷). Verified on the merged tree:
+`cargo test --release` 40/40, GPU build + examples clean on the desktop,
+parity bad = 0.
+
 = What remains
 
-The software is in defensible shape. The science is half-finished, and the half
-that is finished is the half that can be automated.
+All seven items below were addressed in the working tree on 2026-11-08 (round 2;
+vault: `07-Code-Changes/code-changes-2026-11-08-round2.md`):
 
-+ *Layers 2 and 3*: Brody β and the calibration-derived policy are specified but not
-  implemented. Only Layer 1 exists, and it fails on one of three conditions.
-+ *ox*: non-estimable. Whether that is biology (a spectrum genuinely closer to
-  Poisson) or sample size (12 samples, 166 OTUs) is unresolved, and guessing would
-  repeat the error this report documents.
-+ *Calibration vs criterion*: recovery is best at low thresholds while the criterion
-  selects higher ones. Publishing an automatic threshold without acknowledging this
-  trade-off would be dishonest.
-+ *Null models*: M, avg CC and GD still have no degree-preserving null, so
-  "M = 0.65 is high" remains unquantified.
-+ *Over-splitting*: the single-level optimiser fragments communities (5 planted → 24
-  recovered). Multilevel aggregation is the fix.
-+ *Compositionality*: Pearson on relative abundances is biased; CLR-based similarity
-  is not implemented.
-+ *Comparison*: installing iNAP 2.0 and running it on the same three inputs would
-  settle the modularity gap far better than argument.
++ *ox estimability*: raw ox is still not estimable (β = 0.92 at st = 0.52, KS→GOE
+  0.082 — Wigner-like), but with `--clr --clr-pseudocount 0.001` the auto scan
+  *does* converge: st = 0.63, 143/173 kept, M = 0.798, 18 modules, β = 0.435
+  (pseudocount 1.0: st = 0.61, M = 0.787, β = 0.586). The non-estimability is
+  therefore partly a compositionality artefact, not purely biology.
++ *Calibration vs criterion*: still a policy choice, not a bug — recovery is best
+  at low st while the criterion selects higher ones. Layer-3 policy (pick st from
+  calibration once) remains a documented option, deliberately not the default.
++ *Lanczos tail bias*: unchanged caveat — above 512 nodes β/KS read only the top
+  60 Ritz values; do not compare β across the 512 boundary.
++ *Bootstrap stability*: `--boot N` added. box at st = 0.52: mean Jaccard 0.398
+  (n = 20, seed 7; 0.393 at n = 50), ox 0.376, anox 0.392 — modules are real but
+  moderately unstable to sample resampling.
++ *Signed edges*: `--signed` added; sign column in `edges.csv`,
+  `n_negative_edges` in report.json. ox at st = 0.52 has 7 negative edges of 836;
+  RMT/topology are unchanged (they still threshold |r|).
++ *Scale-free test*: Clauset discrete MLE + exact discrete-KS, parametric-bootstrap
+  p-value (`topology.clauset_*` in report.json). Measured at st = 0.52: box
+  γ = 2.68 (xmin = 6, KS = 0.108, p = 1.00), ox γ = 2.57 (p = 0.99), anox
+  γ = 2.09 (p = 0.97) — all three degree tails are consistent with a power law,
+  contradicting the old OLS R² ≈ 0.02–0.06 reading.
++ *iNAP 2.0 comparison*: `tools/compare_inap.py` (self-test included) diffs a mena
+  run against an iNAP export or the 2025 reference repo. Against the 2025 repo on
+  ox: precision = 1.000, recall = 0.929, F1 = 0.963 (mena 836 edges, all inside the
+  2025 900-edge graph; Q mena 0.662 vs 2025 0.586).
 
 = Reproducibility
 
 ```bash
-cargo build --release                              # 18 tests, pre-commit gate
+cargo build --release                              # 40 tests, pre-commit gate
 mena run --abundance real/abundance_ox.csv --traits real/traits_ox.csv \
          --out-dir real/review_ox/auto              # automatic (RMT) threshold
 mena run --abundance real/abundance_ox.csv --traits real/traits_ox.csv \
-         --out-dir real/review_ox/s52 --st 0.52     # forced threshold
+         --out-dir real/review_ox/s52 --st 0.52 --modules louvain --null-samples 100
 pixi run python viz.py all real/review_ox/s52 --out real/review_ox/figs
 pixi run python gui/app.py --root . --port 8770
 ```
 
-Every run writes `rmt_scan.csv` with one row per candidate and an explicit `status`.
+Every run writes `rmt_scan.csv` with one row per candidate and an explicit `status`
+(`accepted`, `rejected_gof`, `excluded_min_nodes`, `excluded_tiny_giant`,
+`excluded_too_few_spacings`, `excluded_low_dof`) plus `brody_beta` and `ks_goe`.
 If no candidate is accepted, no adjacency is written at all: the tool reports
-`not estimable` rather than inventing a graph.
+`not estimable` rather than inventing a graph. Reproduction of §7.3–§8 on the
+post-review working tree (seed 7): box auto st=0.500 (149/758, M=0.608, 10 modules,
+β=0.54), anox auto st=0.600 (159/611, M=0.705, 14 modules, β=0.63), ox not
+estimable (14 candidates: 8 rejected_gof, 6 excluded; β=0.92 at st=0.52); at
+--st 0.52: box 149/694 M=0.639 10 mod, ox 166/836 M=0.662 13 mod, anox 165/850
+M=0.596 11 mod, with Q z = 21.7 / 36.5 / 32.9 against b=100 degree-preserving
+nulls.

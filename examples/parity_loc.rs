@@ -1,8 +1,8 @@
-use hydro_mena::gpu::similarity_gpu;
-use hydro_mena::linalg;
+use mena::gpu::similarity_gpu;
+use mena::linalg;
 fn main() {
     let n = 2100usize; let m = 8;
-    let d = hydro_mena::simulate::simulate(n, m, 4, 2, 8, 0.45, 7);
+    let d = mena::simulate::simulate(n, m, 4, 2, 8, 0.45, 7);
     let z = linalg::standardize_rows(&d.abundance);
     let mut cpu = linalg::correlation_matrix(&z);
     for i in 0..n { for j in 0..n { cpu[(i,j)] = cpu[(i,j)].abs(); } cpu[(i,i)] = 0.0; }

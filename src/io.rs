@@ -20,17 +20,35 @@ pub fn write_abundance_csv(path: &Path, m: &Mat, row_names: &[String], col_names
 }
 
 pub fn read_abundance_csv(path: &Path) -> Result<(Mat, Vec<String>, Vec<String>)> {
-    let mut rdr = csv::Reader::from_path(path)?;
+    // `flexible(true)` hands short/long records to the check below instead of
+    // letting csv's generic "found N fields" error (or, before that check
+    // existed, an out-of-bounds index in Mat::from_shape_fn) be the only guard.
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_path(path)?;
     let header = rdr.headers()?.clone();
     let col_names: Vec<String> = header.iter().skip(1).map(|s| s.to_string()).collect();
     let mut rows: Vec<Vec<f64>> = Vec::new();
     let mut row_names = Vec::new();
     for rec in rdr.records() {
         let rec = rec?;
-        row_names.push(rec[0].to_string());
+        let name = rec[0].to_string();
+        row_names.push(name.clone());
         let mut row = Vec::with_capacity(col_names.len());
         for j in 1..rec.len() {
-            row.push(rec[j].parse::<f64>().context("non-numeric abundance")?);
+            row.push(
+                rec[j]
+                    .parse::<f64>()
+                    .with_context(|| format!("non-numeric abundance in OTU {name}"))?,
+            );
+        }
+        // A short row used to panic later in Mat::from_shape_fn with an
+        // out-of-bounds index; reject it at the source instead.
+        if row.len() != col_names.len() {
+            anyhow::bail!(
+                "{}: OTU {name} has {} values but the header declares {} samples",
+                path.display(),
+                row.len(),
+                col_names.len()
+            );
         }
         rows.push(row);
     }
@@ -119,4 +137,29 @@ pub fn write_csv_matrix(path: &Path, m: &Mat, row_names: &[String], col_names: &
     }
     w.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn ragged_abundance_csv_is_rejected() {
+        let path = std::env::temp_dir().join(format!("mena_ragged_abundance_{}.csv", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp csv");
+            // header declares three samples; the second row carries only two
+            writeln!(f, "OTU,S1,S2,S3").unwrap();
+            writeln!(f, "otu_1,1.0,2.0,3.0").unwrap();
+            writeln!(f, "otu_2,1.0,2.0").unwrap();
+            f.flush().unwrap();
+        }
+        let err = read_abundance_csv(&path).expect_err("a short row must be an error, not a panic");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("otu_2"), "{msg}");
+        assert!(msg.contains("2 values"), "{msg}");
+        assert!(msg.contains("3 samples"), "{msg}");
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -1,5 +1,5 @@
-use hydro_mena::gpu::similarity_gpu;
-use hydro_mena::linalg;
+use mena::gpu::similarity_gpu;
+use mena::linalg;
 use ndarray::Array2;
 fn main() {
     let z = Array2::from_shape_vec((4,3), vec![

@@ -5,9 +5,9 @@
 //! | file | content |
 //! |---|---|
 //! | `report.json` | all scalars + timings (single source of truth) |
-//! | `similarity.csv` | S = abs(r), n x n (only with `--write-similarity`) |
+//! | `similarity.csv` | S = abs(r), n x n (only with `--write-similarity`; raw signed r when `--signed`) |
 //! | `adjacency.csv` | thresholded 0/1 graph on the kept nodes |
-//! | `edges.csv` | `source,target,weight` for network plots |
+//! | `edges.csv` | `source,target,module_source,module_target,sign` (sign = +1/-1, see `--signed`) |
 //! | `nodes.csv` | per-OTU module, role, zi, Pi, degree, MM, strongest trait |
 //! | `rmt_scan.csv` | one row per scanned threshold (chi2, dof, crit, KS) |
 //! | `spectrum.csv` | eigenvalues + unfolded spacings of the kept graph |
@@ -18,8 +18,11 @@
 use crate::eigengene::{eigengenes, trait_significance};
 use crate::io;
 use crate::linalg::{self, Mat};
-use crate::modules::{analyze_modules_with, ModuleAnalysis};
-use crate::network::{self, Topology};
+use crate::modules::{
+    analyze_modules_with, bootstrap_stability, detect_modules, BootReport, ModuleAnalysis,
+    ModulesAlgo,
+};
+use crate::network;
 use crate::rmt::{rmt_threshold, RmtResult};
 use crate::traits::mantel_connectivity_vs_traits;
 use anyhow::Result;
@@ -33,6 +36,13 @@ pub struct RunReport {
     pub n_samples: usize,
     pub n_traits: usize,
     pub gpu_used: bool,
+    /// edges whose raw Pearson r is negative (competition), counted on the
+    /// kept graph; 0 unless `--signed` was requested
+    pub n_negative_edges: usize,
+    /// bootstrap module stability (Jaccard over resampled samples); absent
+    /// unless `RunOptions::boot > 0`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot: Option<BootReport>,
     pub input: InputMeta,
     pub rmt: RmtReport,
     pub topology: TopoReport,
@@ -52,13 +62,18 @@ pub struct InputMeta {
     pub seed: u64,
     pub permutations: usize,
     pub fixed_threshold: Option<f64>,
+    /// true when `--signed` kept the sign of r (negative edges recorded)
+    pub signed: bool,
+    /// bootstrap replicates for module stability (samples resampled with
+    /// replacement, Jaccard per module); 0 = off
+    pub boot: usize,
 }
 
 #[derive(Serialize)]
 pub struct RmtReport {
     pub st: f64,
     pub converged: bool,
-    /// no threshold passed the GOF; `st` is a diagnostic fallback
+    /// no threshold passed the GOF: `st` is NaN and no adjacency is built
     pub fallback: bool,
     pub alpha: f64,
     pub n_points: usize,
@@ -83,6 +98,15 @@ pub struct TopoReport {
     pub r2_powerlaw: f64,
     pub gamma: f64,
     pub r2_hierarchy: f64,
+    /// Clauset MLE power-law fit of the degree tail (gamma, xmin, ks, p)
+    pub clauset_gamma: f64,
+    pub clauset_xmin: f64,
+    pub clauset_ks: f64,
+    pub clauset_p: f64,
+    /// observed-vs-null z-scores (degree-preserving randomisations); absent
+    /// unless `RunOptions::null_samples > 0`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub null: Option<crate::nullmodel::NullReport>,
 }
 
 #[derive(Serialize)]
@@ -107,11 +131,14 @@ pub struct Timing {
     pub similarity_s: f64,
     pub rmt_s: f64,
     pub topology_s: f64,
+    pub null_s: f64,
     pub modules_s: f64,
     pub eigengene_s: f64,
     pub mantel_s: f64,
     pub export_s: f64,
     pub total_s: f64,
+    /// bootstrap module-stability pass (inside the module stage)
+    pub boot_s: f64,
 }
 
 /// Everything the caller can tune, so `run_pipeline` keeps a stable arity.
@@ -133,6 +160,27 @@ pub struct RunOptions {
     pub write_artifacts: bool,
     /// spectral-test toggles (ablated in the B1 study)
     pub rmt_cfg: crate::rmt::RmtConfig,
+    /// apply a per-OTU centred log-ratio transform before standardising.
+    /// Abundance tables are compositional, so only ratios between taxa carry
+    /// information; CLR removes the constant-sum artefact that otherwise shows
+    /// up as spurious correlation between unrelated OTUs.
+    pub clr: bool,
+    /// pseudocount added before the log in the CLR transform (0 is allowed but
+    /// any exact zero in the table then clamps to a tiny positive value)
+    pub clr_pseudocount: f64,
+    /// module-detection optimiser: Louvain (default) or greedy (ablation)
+    pub modules_algo: ModulesAlgo,
+    /// keep the sign of Pearson r instead of |r| (report §10 item 5). The RMT
+    /// stage still thresholds |r| — negative weights would break Deng Eq. 3 —
+    /// so the graph, topology and modularity are identical to the default
+    /// mode; the sign survives only as edge metadata (`edges.csv`) plus
+    /// `n_negative_edges` in report.json.
+    pub signed: bool,
+    /// degree-preserving null replicates for topology z-scores; 0 = off
+    pub null_samples: usize,
+    /// bootstrap replicates for module stability (samples resampled with
+    /// replacement, Jaccard per module); 0 = off
+    pub boot: usize,
     /// provenance labels recorded in report.json
     pub abundance_path: String,
     pub traits_path: String,
@@ -151,6 +199,12 @@ impl Default for RunOptions {
             write_similarity: false,
             write_artifacts: true,
             rmt_cfg: crate::rmt::RmtConfig::default(),
+            clr: false,
+            clr_pseudocount: 1.0,
+            modules_algo: ModulesAlgo::Louvain,
+            signed: false,
+            boot: 0,
+            null_samples: 0,
             abundance_path: String::new(),
             traits_path: String::new(),
         }
@@ -167,7 +221,31 @@ pub struct RunArtifacts {
 /// The GPU result is *used*; the previous version discarded it and recomputed
 /// the whole matrix on the CPU ("[gpu] similarity computed" followed by a
 /// silent CPU pass), so `--gpu` reported `gpu_used=true` while burning both.
-fn similarity(z: &Mat, use_gpu: bool) -> (Mat, bool) {
+///
+/// `signed` selects the raw Pearson r instead of |r|. The GPU kernel computes
+/// |r| (see `gpu.rs`), so a signed request is served on the CPU and says so.
+/// Similarity and thresholded adjacency at a fixed `st`, with no RMT scan and
+/// no node pruning: the shared core of a `--st` run and the bootstrap
+/// replicates, so both see exactly the same graph construction.
+///
+/// Returns `(S, A)` on the full OTU set (`S = |r|` of the row-standardised
+/// table, `A_ij = 1` when `S_ij >= st`). `abundance` must already carry the
+/// pipeline's preprocessing: [`run_pipeline`] applies `--clr` once and passes
+/// the transformed table here, so the bootstrap inherits the same transform.
+pub fn adjacency_at(abundance: &Mat, st: f64) -> (Mat, Mat) {
+    let z = linalg::standardize_rows(abundance);
+    let s = linalg::similarity_from_standardized(&z);
+    let a = crate::rmt::adjacency(&s, st);
+    (s, a)
+}
+
+fn similarity(z: &Mat, use_gpu: bool, signed: bool) -> (Mat, bool) {
+    if signed {
+        if use_gpu {
+            eprintln!("[gpu] --signed needs the raw r; the GPU kernel only computes |r|, so using CPU");
+        }
+        return (linalg::similarity_signed(z), false);
+    }
     #[cfg(feature = "gpu")]
     {
         if use_gpu {
@@ -199,22 +277,51 @@ pub fn run_pipeline(
     }
     let t0 = Instant::now();
 
+    // Compositionality fix, applied to the table between loading and
+    // standardising, i.e. where a preprocessing transform belongs. CLR output is
+    // already centred per row (each OTU row sums to zero) and `standardize_rows`
+    // re-centres and rescales every row anyway, so this later pass only divides
+    // each CLR row by its own standard deviation: it cannot undo the log-ratio
+    // transform, and it keeps the paper's transform -> standardise -> correlate
+    // shape intact instead of special-casing CLR to skip a step.
+    let abundance: std::borrow::Cow<'_, Mat> = if opts.clr {
+        std::borrow::Cow::Owned(linalg::clr_transform(abundance, opts.clr_pseudocount))
+    } else {
+        std::borrow::Cow::Borrowed(abundance)
+    };
+    let abundance = abundance.as_ref();
+
     let t = Instant::now();
     let z = linalg::standardize_rows(abundance);
     let standardize_s = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    let (s, gpu_used) = similarity(&z, opts.use_gpu);
+    let (s_raw, gpu_used) = similarity(&z, opts.use_gpu, opts.signed);
     let similarity_s = t.elapsed().as_secs_f64();
+    // Signed mode (report §10 item 5): `s_raw` holds r, not |r|. Deng Eq. 3 and
+    // the Poisson spacing GOF are only defined for non-negative weights, so the
+    // RMT scan, the adjacency, the topology and the modularity all keep running
+    // on |r| — i.e. exactly the paper-faithful graph of the default mode, whose
+    // threshold semantics are unchanged. The sign is carried as edge metadata
+    // (`sign` column in edges.csv, `n_negative_edges` in report.json) instead
+    // of as a negative weight in the spectrum. `s_raw` itself is what goes to
+    // similarity.csv in signed mode, so the artifact keeps the full r.
+    let s_abs_buf;
+    let s_abs: &Mat = if opts.signed {
+        s_abs_buf = s_raw.mapv(f64::abs);
+        &s_abs_buf
+    } else {
+        &s_raw
+    };
     if opts.write_artifacts && opts.write_similarity {
-        io::write_csv_matrix(&opts.out_dir.join("similarity.csv"), &s, otu_names, otu_names, "OTU")?;
+        io::write_csv_matrix(&opts.out_dir.join("similarity.csv"), &s_raw, otu_names, otu_names, "OTU")?;
     }
 
     let t = Instant::now();
     let min_nodes = (abundance.nrows() / 10).max(10);
     let rmt = match opts.fixed_st {
-        Some(st) => crate::rmt::at_threshold(&s, st),
-        None => rmt_threshold(&s, opts.rmt_start, min_nodes, opts.alpha, &opts.rmt_cfg),
+        Some(st) => crate::rmt::at_threshold(s_abs, st),
+        None => rmt_threshold(s_abs, opts.rmt_start, min_nodes, opts.alpha, &opts.rmt_cfg),
     };
     let rmt_s = t.elapsed().as_secs_f64();
     eprintln!(
@@ -240,12 +347,16 @@ pub fn run_pipeline(
             n_samples: abundance.ncols(),
             n_traits: traits.ncols(),
             gpu_used,
+            n_negative_edges: 0,
+            boot: None,
             input: InputMeta {
                 abundance: opts.abundance_path.clone(),
                 traits: opts.traits_path.clone(),
                 seed: opts.seed,
                 permutations: opts.n_perm,
                 fixed_threshold: opts.fixed_st,
+                signed: opts.signed,
+            boot: opts.boot,
             },
             rmt: RmtReport {
                 st: f64::NAN,
@@ -262,6 +373,10 @@ pub fn run_pipeline(
                 connected_frac: f64::NAN, n_components: 0, giant_frac: f64::NAN,
                 avg_cc: f64::NAN, modularity: f64::NAN, n_modules: 0,
                 r2_powerlaw: f64::NAN, gamma: f64::NAN, r2_hierarchy: f64::NAN,
+                clauset_gamma: f64::NAN, clauset_xmin: f64::NAN,
+                clauset_ks: f64::NAN, clauset_p: f64::NAN,
+                // no adjacency exists, so there is nothing to randomise
+                null: None,
             },
             modules: ModuleReport {
                 modularity: f64::NAN, n_modules: 0, sizes: Vec::new(),
@@ -277,11 +392,13 @@ pub fn run_pipeline(
                 similarity_s,
                 rmt_s,
                 topology_s: f64::NAN,
+                null_s: f64::NAN,
                 modules_s: f64::NAN,
                 eigengene_s: f64::NAN,
                 mantel_s: f64::NAN,
                 export_s: 0.0,
                 total_s: t0.elapsed().as_secs_f64(),
+                boot_s: f64::NAN,
             },
         };
         if opts.write_artifacts {
@@ -303,17 +420,64 @@ pub fn run_pipeline(
     let kept_names: Vec<String> = kept.iter().map(|&i| otu_names[i].clone()).collect();
     let zk = Mat::from_shape_fn((p, abundance.ncols()), |(i, j)| z[(kept[i], j)]);
 
-    let t = Instant::now();
-    let (topo, partition) = network::topology_parts(&a);
-    let topology_s = t.elapsed().as_secs_f64();
+    // Negative edges on exactly the graph edges.csv enumerates (the kept
+    // subgraph at |r| >= st): a pair is negative when its raw r < 0. Computed
+    // here, once, so report.json and edges.csv cannot disagree.
+    let n_negative_edges = if opts.signed {
+        let mut c = 0usize;
+        for x in 0..p {
+            for y in (x + 1)..p {
+                if a[(x, y)] > 0.0 && s_raw[(kept[x], kept[y])] < 0.0 {
+                    c += 1;
+                }
+            }
+        }
+        c
+    } else {
+        0
+    };
 
     let t = Instant::now();
-    let mod_analysis: ModuleAnalysis = analyze_modules_with(
-        &network::adjacency_list(&a),
-        topo.modularity,
-        partition,
-    );
+    let (topo, _) = network::topology_parts(&a);
+    let topology_s = t.elapsed().as_secs_f64();
+
+    // Null models: observed topology vs `b` degree-preserving randomisations.
+    // Off by default (0) because each replicate costs a full rewiring + the
+    // statistics on it; when on, the z-scores land in report.json under
+    // `topology.null`.
+    let t = Instant::now();
+    let null = if opts.null_samples > 0 {
+        Some(crate::nullmodel::null_zscores(&a, opts.null_samples, opts.seed))
+    } else {
+        None
+    };
+    let null_s = t.elapsed().as_secs_f64();
+
+    let t = Instant::now();
+    // Partition from the selected optimiser (Louvain by default, greedy as the
+    // ablation), then roles on exactly that partition: re-optimising inside
+    // `analyze_modules_with` would let the reported modularity describe a
+    // different partition than the roles and eigengenes do.
+    let det = detect_modules(&a, opts.modules_algo);
+    let mod_analysis: ModuleAnalysis =
+        analyze_modules_with(&network::adjacency_list(&a), det.modularity, det.module_of);
     let modules_s = t.elapsed().as_secs_f64();
+
+    let t_boot = Instant::now();
+    let boot = if opts.boot > 0 {
+        let sample_cols: Vec<usize> = (0..abundance.ncols()).collect();
+        Some(bootstrap_stability(
+            abundance,
+            &sample_cols,
+            rmt.st,
+            opts.modules_algo,
+            opts.boot,
+            opts.seed,
+        ))
+    } else {
+        None
+    };
+    let boot_s = t_boot.elapsed().as_secs_f64();
 
     let t = Instant::now();
     let tz = linalg::standardize_rows(&traits.t().to_owned()).t().to_owned();
@@ -355,12 +519,16 @@ pub fn run_pipeline(
         n_samples: abundance.ncols(),
         n_traits: traits.ncols(),
         gpu_used,
+        n_negative_edges,
+        boot,
         input: InputMeta {
             abundance: opts.abundance_path.clone(),
             traits: opts.traits_path.clone(),
             seed: opts.seed,
             permutations: opts.n_perm,
             fixed_threshold: opts.fixed_st,
+            signed: opts.signed,
+            boot: opts.boot,
         },
         rmt: RmtReport {
             st: rmt.st,
@@ -382,11 +550,18 @@ pub fn run_pipeline(
             n_components: topo.n_components,
             giant_frac: topo.giant_frac,
             avg_cc: topo.avg_cc,
-            modularity: topo.modularity,
-            n_modules: topo.n_modules,
+            // reported from the partition actually used below, not from the
+            // greedy partition `topology_parts` builds internally
+            modularity: det.modularity,
+            n_modules: det.n_modules,
             r2_powerlaw: topo.r2_powerlaw,
             gamma: topo.gamma,
             r2_hierarchy: topo.r2_hierarchy,
+            clauset_gamma: topo.clauset_gamma,
+            clauset_xmin: topo.clauset_xmin,
+            clauset_ks: topo.clauset_ks,
+            clauset_p: topo.clauset_p,
+            null,
         },
         modules: ModuleReport {
             modularity: mod_analysis.modularity,
@@ -409,6 +584,8 @@ pub fn run_pipeline(
             similarity_s,
             rmt_s,
             topology_s,
+            null_s,
+            boot_s,
             modules_s,
             eigengene_s,
             mantel_s,
@@ -428,17 +605,17 @@ pub fn run_pipeline(
         &opts.out_dir,
         &a,
         &kept_names,
-        &s,
+        &s_raw,
         otu_names,
         sample_names,
         trait_names,
         &rmt,
-        &topo,
         &mod_analysis,
         &eig,
         &gs,
         &module_names,
         opts.write_similarity,
+        opts.signed,
     )?;
     let export_s = t.elapsed().as_secs_f64();
 
@@ -455,7 +632,10 @@ pub fn run_pipeline(
 /// statistic. This file is the audit trail: it must explain a failure, not hide it.
 fn write_scan_csv(out: &Path, log: &[crate::rmt::ScanPoint]) -> Result<()> {
     let mut w = csv::Writer::from_path(out.join("rmt_scan.csv"))?;
-    w.write_record(["st", "p", "edges", "chi2", "dof", "crit", "poisson", "ks", "giant_frac", "status"])?;
+    w.write_record([
+        "st", "p", "edges", "chi2", "dof", "crit", "poisson", "ks", "brody_beta", "ks_goe",
+        "giant_frac", "status",
+    ])?;
     for pt in log {
         w.write_record([
             format!("{:.4}", pt.st),
@@ -466,6 +646,12 @@ fn write_scan_csv(out: &Path, log: &[crate::rmt::ScanPoint]) -> Result<()> {
             format!("{:.4}", pt.crit),
             pt.poisson.to_string(),
             format!("{:.4}", pt.ks),
+            // Brody spacing-ratio fit (beta = 1 Poisson, 2 GOE) and the KS
+            // distance to the GOE CDF: the same point can be Poisson-compatible
+            // on chi^2 and still lean GOE on beta, so both are written out and
+            // neither is used to override the accepted/rejected status.
+            format!("{:.4}", pt.brody_beta),
+            format!("{:.4}", pt.ks_goe),
             format!("{:.4}", pt.giant_frac),
             pt.status.clone(),
         ])?;
@@ -484,12 +670,12 @@ fn write_artifacts(
     sample_names: &[String],
     trait_names: &[String],
     rmt: &RmtResult,
-    topo: &Topology,
     ma: &ModuleAnalysis,
     eig: &crate::eigengene::EigengeneResult,
     gs: &Mat,
     module_names: &[String],
     write_similarity: bool,
+    signed: bool,
 ) -> Result<()> {
     if write_similarity {
         io::write_csv_matrix(&out.join("similarity.csv"), s, otu_names, otu_names, "OTU")?;
@@ -506,19 +692,24 @@ fn write_artifacts(
         io::write_csv_matrix(&out.join("fig5_q.csv"), &qm, module_names, trait_names, "module")?;
     }
 
-    // edges (weight = |r| when the similarity matrix is available)
+    // edges. `sign` is always written: +1 when only |r| was kept (default
+    // mode, where every edge is a positive association), and the sign of the
+    // raw Pearson r under `--signed` (-1 = anticorrelated pair). 0 cannot
+    // occur on a written edge: the edge exists only when |r| >= st > 0.
     {
         let mut w = csv::Writer::from_path(out.join("edges.csv"))?;
-        w.write_record(["source", "target", "module_source", "module_target"])?;
+        w.write_record(["source", "target", "module_source", "module_target", "sign"])?;
         let n = a.nrows();
         for i in 0..n {
             for j in (i + 1)..n {
                 if a[(i, j)] > 0.0 {
+                    let sign = if signed && s[(rmt.kept[i], rmt.kept[j])] < 0.0 { -1 } else { 1 };
                     w.write_record([
                         names[i].clone(),
                         names[j].clone(),
                         format!("{}", ma.module_of[i] + 1),
                         format!("{}", ma.module_of[j] + 1),
+                        sign.to_string(),
                     ])?;
                 }
             }
@@ -528,7 +719,6 @@ fn write_artifacts(
 
     // per-OTU table: everything a network viewer or a scatter plot needs
     {
-        let n = a.nrows();
         let mut w = csv::Writer::from_path(out.join("nodes.csv"))?;
         w.write_record([
             "OTU", "module", "zi", "Pi", "degree", "role", "MM_eigengene", "gs_max", "gs_trait",
@@ -543,7 +733,6 @@ fn write_artifacts(
                     gs_trait = trait_names.get(h).cloned().unwrap_or_default();
                 }
             }
-            let _ = n;
             w.write_record([
                 names[i].clone(),
                 format!("{}", r.module + 1),
@@ -603,7 +792,6 @@ fn write_artifacts(
         }
         w.flush()?;
     }
-    let _ = topo;
     Ok(())
 }
 
@@ -671,11 +859,13 @@ pub fn bench_all(out_dir: &Path) -> Result<Vec<BenchRow>> {
                         similarity_s: t.similarity_s,
                         rmt_s: t.rmt_s,
                         topology_s: t.topology_s,
+                        null_s: t.null_s,
                         modules_s: t.modules_s,
                         eigengene_s: t.eigengene_s,
                         mantel_s: t.mantel_s,
                         export_s: t.export_s,
                         total_s: t.total_s,
+                        boot_s: t.boot_s,
                     },
                     detail,
                 ));
@@ -776,4 +966,99 @@ pub fn bench_all(out_dir: &Path) -> Result<Vec<BenchRow>> {
     #[cfg(not(feature = "gpu"))]
     eprintln!("[gpu] built without gpu feature; GPU rows skipped (build with --features gpu)");
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulate;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("mena_pipe_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn read_csv_rows(path: &Path) -> (Vec<String>, Vec<Vec<String>>) {
+        let mut rdr = csv::Reader::from_path(path).expect("open csv");
+        let header: Vec<String> = rdr.headers().expect("header").iter().map(str::to_string).collect();
+        let rows = rdr
+            .records()
+            .map(|rec| rec.expect("record").iter().map(str::to_string).collect())
+            .collect();
+        (header, rows)
+    }
+
+    /// Simulated table plus one exact mirror of the first OTU: Pearson r of
+    /// that pair is -1, so a signed run must contain at least one negative
+    /// edge no matter how the rest of the data correlates.
+    fn mirrored_input() -> (Mat, Vec<String>, Vec<String>, Mat, Vec<String>) {
+        let d = simulate::simulate(80, 12, 3, 2, 6, 0.45, 11);
+        let (n, m) = (d.abundance.nrows(), d.abundance.ncols());
+        let mut ab = Mat::zeros((n + 1, m));
+        ab.slice_mut(ndarray::s![..n, ..]).assign(&d.abundance);
+        for j in 0..m {
+            ab[(n, j)] = d.abundance[(0, m - 1 - j)];
+        }
+        let mut names = d.otu_names.clone();
+        names.push("mirror_OTU".to_string());
+        (ab, names, d.sample_names, d.traits, d.trait_names)
+    }
+
+    #[test]
+    fn signed_mode_marks_negative_edges_and_reports_the_count() {
+        let (ab, names, samples, traits, trait_names) = mirrored_input();
+
+        let out_signed = scratch("signed");
+        let opts_signed = RunOptions {
+            out_dir: out_signed.clone(),
+            n_perm: 19,
+            seed: 4,
+            fixed_st: Some(0.55),
+            signed: true,
+            ..Default::default()
+        };
+        let art = run_pipeline(&ab, &names, &samples, &traits, &trait_names, &opts_signed).unwrap();
+        assert!(art.report.topology.edges > 0, "fixed st kept no edges");
+        assert!(art.report.input.signed);
+
+        let (header, rows) = read_csv_rows(&out_signed.join("edges.csv"));
+        assert_eq!(header.last().map(String::as_str), Some("sign"), "header {header:?}");
+        assert!(rows.iter().all(|r| r.len() == header.len()));
+        let neg = rows.iter().filter(|r| r[4] == "-1").count();
+        assert!(neg >= 1, "the mirrored OTU pair must be a negative edge");
+        assert_eq!(neg, art.report.n_negative_edges, "report count vs edges.csv");
+        assert!(rows.iter().all(|r| r[4] == "1" || r[4] == "-1"));
+
+        // the field must survive serialisation, not just live in the struct
+        let js: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out_signed.join("report.json")).unwrap()).unwrap();
+        assert_eq!(js["n_negative_edges"].as_u64().unwrap() as usize, neg);
+        assert_eq!(js["input"]["signed"].as_bool().unwrap(), true);
+
+        // default mode: same graph (signed is metadata, not a different graph),
+        // every edge +1, zero negative edges
+        let out_plain = scratch("plain");
+        let opts_plain = RunOptions {
+            out_dir: out_plain.clone(),
+            n_perm: 19,
+            seed: 4,
+            fixed_st: Some(0.55),
+            signed: false,
+            boot: 0,
+            ..Default::default()
+        };
+        let art0 = run_pipeline(&ab, &names, &samples, &traits, &trait_names, &opts_plain).unwrap();
+        let (header0, rows0) = read_csv_rows(&out_plain.join("edges.csv"));
+        assert_eq!(header0, header);
+        assert_eq!(art0.report.n_negative_edges, 0);
+        assert!(rows0.iter().all(|r| r[4] == "1"));
+        let pairs = |rs: &Vec<Vec<String>>| -> Vec<(String, String)> {
+            rs.iter().map(|r| (r[0].clone(), r[1].clone())).collect()
+        };
+        assert_eq!(pairs(&rows), pairs(&rows0), "signed mode changed the edge set");
+
+        let _ = std::fs::remove_dir_all(&out_signed);
+        let _ = std::fs::remove_dir_all(&out_plain);
+    }
 }

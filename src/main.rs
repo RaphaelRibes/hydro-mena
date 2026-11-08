@@ -8,9 +8,29 @@
 //!   bench      benchmark the real pipeline (and GPU similarity with --features gpu)
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use mena::modules::ModulesAlgo;
 use mena::pipeline::RunOptions;
 use mena::{io, pipeline, simulate};
 use std::path::PathBuf;
+
+/// CLI mirror of [`mena::modules::ModulesAlgo`], so clap can validate the value
+/// (`--modules louvain|greedy`) without the library having to depend on clap.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ModulesArg {
+    /// Louvain modularity optimisation (default)
+    Louvain,
+    /// Greedy agglomerative modularity (previous behaviour, kept as ablation)
+    Greedy,
+}
+
+impl From<ModulesArg> for ModulesAlgo {
+    fn from(a: ModulesArg) -> Self {
+        match a {
+            ModulesArg::Louvain => ModulesAlgo::Louvain,
+            ModulesArg::Greedy => ModulesAlgo::Greedy,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "hydro-mena", version, about = "RMT-based molecular ecological network analysis (MENA)")]
@@ -44,6 +64,11 @@ enum Cmd {
         out_dir: PathBuf,
     },
     /// Run the full MENA pipeline
+    #[command(after_help = "\
+Compositionality: --clr applies a per-OTU centred log-ratio transform before standardising \
+(pseudocount --clr-pseudocount, default 1.0); without it, raw abundances are correlated as before.
+Modules: --modules louvain (default) or greedy (the old optimiser, kept as an ablation).
+Nulls: --null-samples B adds null-model z-scores under topology.null in report.json (0 = off).\nBootstrap: --boot N resamples samples N times and reports module stability (Jaccard) under boot in report.json (0 = off).")]
     Run {
         #[arg(long)]
         abundance: PathBuf,
@@ -79,6 +104,27 @@ enum Cmd {
         /// ablation: minimum dof for a point to count as estimable
         #[arg(long, default_value = "2")]
         min_dof: usize,
+        /// Apply a per-OTU centred log-ratio transform before standardising
+        /// (compositionality fix: only ratios between taxa carry information)
+        #[arg(long)]
+        clr: bool,
+        /// Pseudocount added before the log in the CLR transform
+        #[arg(long, default_value = "1.0")]
+        clr_pseudocount: f64,
+        /// Keep the sign of Pearson r (competition vs cooperation): the graph is
+        /// still built on |r|, but edges.csv gains a sign column (-1/0/+1) and
+        /// report.json reports n_negative_edges
+        #[arg(long)]
+        signed: bool,
+    /// bootstrap replicates for module stability (Jaccard); 0 = off
+    #[arg(long, default_value_t = 0)]
+    boot: usize,
+        /// Module-detection algorithm
+        #[arg(long, value_enum, default_value = "louvain")]
+        modules: ModulesArg,
+        /// Degree-preserving null replicates for topology z-scores (0 = off)
+        #[arg(long, default_value = "0")]
+        null_samples: usize,
     },
     /// Similarity + RMT scan diagnostics only
     Steps {
@@ -86,13 +132,18 @@ enum Cmd {
         abundance: PathBuf,
         #[arg(long, default_value = "out")]
         out_dir: PathBuf,
+        /// Lowest threshold the RMT scan considers (default 0.30)
         #[arg(long, default_value = "0.30")]
         rmt_start: f64,
+        /// Significance level of the Poisson GOF in the RMT scan
+        #[arg(long, default_value = "0.01")]
+        alpha: f64,
     },
     /// Benchmark the pipeline (CPU, and GPU similarity when built with the gpu feature)
     Bench {
         #[arg(long, default_value = "out")]
         out_dir: PathBuf,
+        /// Case-insensitive substring filter on the benchmark row name; "all" keeps every row
         #[arg(long, default_value = "all")]
         which: String,
     },
@@ -147,6 +198,12 @@ fn main() -> Result<()> {
             no_trim,
             min_spacings,
             min_dof,
+            clr,
+            clr_pseudocount,
+            signed,
+            boot,
+            modules,
+            null_samples,
         } => {
             let (ab, otu_names, sample_names) = io::read_abundance_csv(&abundance)?;
             let (tr, _sn, trait_names) = io::read_traits_csv(&traits, &sample_names)?;
@@ -167,6 +224,12 @@ fn main() -> Result<()> {
                     min_dof,
                     ..Default::default()
                 },
+                clr,
+                clr_pseudocount,
+                modules_algo: modules.into(),
+                signed,
+                boot,
+                null_samples,
                 abundance_path: abundance.display().to_string(),
                 traits_path: traits.display().to_string(),
             };
@@ -187,6 +250,12 @@ fn main() -> Result<()> {
                 "modularity M={:.3} modules={} R2_power={:.2} gamma={:.2} R2_hier={:.2}",
                 t.modularity, t.n_modules, t.r2_powerlaw, t.gamma, t.r2_hierarchy
             );
+            if r.input.signed {
+                println!(
+                    "signed: {} of {} edges are negative (anticorrelated; sign column in edges.csv)",
+                    r.n_negative_edges, r.rmt.edges
+                );
+            }
             println!("modules: sizes={:?} roles={:?}", r.modules.sizes, r.modules.role_counts);
             println!(
                 "eigengene var explained: {:?}",
@@ -209,14 +278,14 @@ fn main() -> Result<()> {
             println!("timing: total={:.2}s {:?}", r.timing_s.total_s, serde_json::to_value(&r.timing_s)?);
             println!("artifacts in {}", out_dir.display());
         }
-        Cmd::Steps { abundance, out_dir, rmt_start } => {
+        Cmd::Steps { abundance, out_dir, rmt_start, alpha } => {
             let (ab, otu_names, _sample_names) = io::read_abundance_csv(&abundance)?;
             std::fs::create_dir_all(&out_dir)?;
             let z = mena::linalg::standardize_rows(&ab);
             let s = mena::linalg::similarity_from_standardized(&z);
             let n = s.nrows();
             io::write_csv_matrix(&out_dir.join("similarity.csv"), &s, &otu_names, &otu_names, "OTU")?;
-            let rmt = mena::rmt::rmt_threshold(&s, rmt_start, (n / 10).max(10), 0.01, &mena::rmt::RmtConfig::default());
+            let rmt = mena::rmt::rmt_threshold(&s, rmt_start, (n / 10).max(10), alpha, &mena::rmt::RmtConfig::default());
             println!(
                 "st={:.3} converged={} fallback={} kept={}/{}",
                 rmt.st,
@@ -230,10 +299,15 @@ fn main() -> Result<()> {
         Cmd::Bench { out_dir, which } => {
             std::fs::create_dir_all(&out_dir)?;
             let rows = pipeline::bench_all(&out_dir)?;
+            let needle = which.to_ascii_lowercase();
+            let kept: Vec<&pipeline::BenchRow> = rows
+                .iter()
+                .filter(|r| needle == "all" || r.name.to_ascii_lowercase().contains(&needle))
+                .collect();
             let mut w = csv::Writer::from_path(out_dir.join("bench.csv"))?;
             w.write_record(["name", "mode", "stage", "n_otus", "n_samples", "seconds", "repeats", "maxdiff", "detail"])?;
-            println!("\n=== benchmarks ({which}) ===");
-            for r in &rows {
+            println!("\n=== benchmarks ({which}) — {} of {} rows kept ===", kept.len(), rows.len());
+            for r in &kept {
                 println!(
                     "{:<34} {:<4} {:<10} n={:<5} m={:<3} {:>8.4}s  {}",
                     r.name, r.mode, r.stage, r.n_otus, r.n_samples, r.seconds, r.detail

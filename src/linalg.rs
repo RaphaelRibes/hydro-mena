@@ -61,6 +61,49 @@ pub fn standardize_rows(x: &Mat) -> Mat {
     z
 }
 
+/// Per-OTU centred log-ratio transform (compositionality fix).
+///
+/// Abundance tables are compositional: the counts only carry information about
+/// *ratios* between taxa, because they are constrained by the sequencing depth.
+/// Correlating raw (or relative) abundances therefore picks up spurious
+/// co-variation induced by that closure constraint. CLR removes it by mapping
+/// every row (OTU) to its log-ratios against the row's geometric mean:
+///
+/// ```text
+/// z_ij = log(x_ij + psi) - (1/m) * sum_k log(x_ik + psi)
+/// ```
+///
+/// so `z_i` sums to zero by construction and only relative information survives.
+/// `psi` is a pseudocount keeping zeros (and near-zeros) finite.
+pub fn clr_transform(x: &Mat, pseudocount: f64) -> Mat {
+    let (n, m) = (x.nrows(), x.ncols());
+    if n == 0 || m == 0 {
+        return x.clone();
+    }
+    let x = as_std(x);
+    let x = x.as_ref();
+    let mut z = x.clone();
+    let xs = x.as_slice().expect("row-major matrix");
+    let psi = pseudocount.max(0.0);
+    z.as_slice_mut()
+        .expect("row-major matrix")
+        .par_chunks_mut(m)
+        .enumerate()
+        .for_each(|(i, row)| {
+            let src = &xs[i * m..(i + 1) * m];
+            // A negative pseudocount, or a value below -psi, would make the log
+            // undefined and poison the whole matrix with NaN through the
+            // downstream correlation, so clamp the shifted value to the smallest
+            // positive double instead of propagating +/-inf.
+            let log_of = |v: f64| (v + psi).max(f64::MIN_POSITIVE).ln();
+            let mean = src.iter().map(|&v| log_of(v)).sum::<f64>() / m as f64;
+            for (dst, &v) in row.iter_mut().zip(src.iter()) {
+                *dst = log_of(v) - mean;
+            }
+        });
+    z
+}
+
 /// Pearson correlation matrix of the rows of `x` (OTUs x samples), Eq. (1).
 ///
 /// Computed from the standardized rows: with unit-variance rows,
@@ -118,6 +161,41 @@ pub fn similarity_from_standardized(z: &Mat) -> Mat {
                     acc += zi[k] * zj[k];
                 }
                 row[j] = (acc / denom).abs();
+            }
+        });
+    mirror_upper(&mut s);
+    s
+}
+
+/// **Signed** similarity matrix S = r with a zero diagonal.
+///
+/// [`similarity_from_standardized`] throws the sign away (|r|, the paper's
+/// Eq. 2 and the default). That is fine for the RMT threshold and the network
+/// topology, but it collapses competition (negative association) and
+/// cooperation (positive) onto the same number. This variant keeps the raw
+/// Pearson r; callers that need the paper-faithful non-negative matrix take
+/// the absolute value afterwards.
+pub fn similarity_signed(z: &Mat) -> Mat {
+    let (n, m) = (z.nrows(), z.ncols());
+    let mut s = Mat::zeros((n, n));
+    if n == 0 || m < 2 {
+        return s;
+    }
+    let zs = z.as_slice().expect("row-major matrix");
+    let denom = (m - 1) as f64;
+    s.as_slice_mut()
+        .expect("row-major matrix")
+        .par_chunks_mut(n)
+        .enumerate()
+        .for_each(|(i, row)| {
+            let zi = &zs[i * m..(i + 1) * m];
+            for j in (i + 1)..n {
+                let zj = &zs[j * m..(j + 1) * m];
+                let mut acc = 0.0;
+                for k in 0..m {
+                    acc += zi[k] * zj[k];
+                }
+                row[j] = acc / denom;
             }
         });
     mirror_upper(&mut s);
@@ -226,6 +304,31 @@ mod tests {
     }
 
     #[test]
+    fn clr_is_centred_and_matches_known_values() {
+        // psi = 0 on rows [2,4,8] and [5,5,5]: the log-ratios are exact
+        // multiples of ln 2, and the constant row must collapse to exactly zero.
+        let x = Mat::from_shape_vec((2, 3), vec![2.0, 4.0, 8.0, 5.0, 5.0, 5.0]).unwrap();
+        let z = clr_transform(&x, 0.0);
+        let ln2 = 2.0f64.ln();
+        for (j, want) in [-ln2, 0.0, ln2].iter().enumerate() {
+            assert!((z[(0, j)] - want).abs() < 1e-12, "row0 = {:?}", z.row(0));
+        }
+        for j in 0..3 {
+            assert_eq!(z[(1, j)], 0.0, "constant row must be exactly zero");
+        }
+        // pseudocount shifts the geometric mean: psi = 1 on [1,3] gives
+        // log 2 - (log 2 + log 4)/2 = -0.5 ln 2, and +0.5 ln 2 for the other cell.
+        let y = Mat::from_shape_vec((1, 2), vec![1.0, 3.0]).unwrap();
+        let zy = clr_transform(&y, 1.0);
+        assert!((zy[(0, 0)] + 0.5 * ln2).abs() < 1e-12, "got {:?}", zy.row(0));
+        assert!((zy[(0, 1)] - 0.5 * ln2).abs() < 1e-12, "got {:?}", zy.row(0));
+        // every row sums to zero by construction
+        for i in 0..2 {
+            assert!(z.row(i).sum().abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn correlation_of_identical_rows_is_one() {
         let x = Mat::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]).unwrap();
         let r = correlation_matrix(&x);
@@ -251,5 +354,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn signed_similarity_keeps_anticorrelation() {
+        // rows [1,2,3,4] and [4,3,2,1]: Pearson r = -1
+        let x = Mat::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0]).unwrap();
+        let z = standardize_rows(&x);
+        let r = similarity_signed(&z);
+        assert_eq!(r[(0, 0)], 0.0);
+        assert_eq!(r[(1, 1)], 0.0);
+        assert!((r[(0, 1)] + 1.0).abs() < 1e-12, "got {}", r[(0, 1)]);
+        assert!((r[(1, 0)] + 1.0).abs() < 1e-12, "asymmetric: {}", r[(1, 0)]);
+        // signed value is exactly the correlation, and the default keeps |r|
+        let c = correlation_matrix(&x);
+        assert!((r[(0, 1)] - c[(0, 1)]).abs() < 1e-12);
+        let s = similarity_from_standardized(&z);
+        assert!((s[(0, 1)] - 1.0).abs() < 1e-12);
+        // cooperative rows stay positive: sign is not just flipped
+        let y = Mat::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0]).unwrap();
+        let ry = similarity_signed(&standardize_rows(&y));
+        assert!((ry[(0, 1)] - 1.0).abs() < 1e-12, "got {}", ry[(0, 1)]);
     }
 }
