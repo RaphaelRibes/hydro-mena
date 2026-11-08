@@ -55,6 +55,11 @@ pub struct ScanPoint {
     pub ks: f64,
     /// share of kept nodes inside the giant component the test was run on
     pub giant_frac: f64,
+    /// why this candidate was accepted or dropped: `accepted`, `rejected_gof`,
+    /// `excluded_min_nodes`, `excluded_tiny_giant`, `excluded_too_few_spacings`,
+    /// `excluded_low_dof`. Every candidate is reported, so the curve can be
+    /// audited instead of silently thinned to its survivors.
+    pub status: String,
 }
 
 /// Symmetric 0/1 adjacency from the similarity matrix at threshold `st`.
@@ -267,12 +272,25 @@ fn giant_component(a: &Mat, keep: &[usize]) -> (Vec<usize>, f64) {
 
 /// Evaluate one candidate threshold: eigen-decompose the adjacency, unfold,
 /// run the Poisson GOF.
-fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> Option<ScanPoint> {
+fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> ScanPoint {
     let a = adjacency(s, st);
     let keep = kept_nodes(&a);
     let p = keep.len();
+    let edges = edges_of(&a);
+    let ex = |p: usize, edges: usize, reason: &str, giant_frac: f64| ScanPoint {
+        st,
+        p,
+        edges,
+        chi2: f64::NAN,
+        dof: 0,
+        crit: f64::NAN,
+        poisson: false,
+        ks: f64::NAN,
+        giant_frac,
+        status: reason.to_string(),
+    };
     if p < min_nodes.max(6) {
-        return None;
+        return ex(p, edges, "excluded_min_nodes", f64::NAN);
     }
     let (giant, giant_frac) = if cfg.giant {
         giant_component(&a, &keep)
@@ -280,12 +298,12 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
         ((0..keep.len()).collect::<Vec<usize>>(), 1.0)
     };
     if giant.len() < min_nodes.max(6) {
-        return None;
+        return ex(p, edges, "excluded_tiny_giant", giant_frac);
     }
     let g = giant.len();
     // Deng/Luo eigen-decompose the *thresholded similarity* matrix (weights
-    // retained, below-threshold entries zeroed, diagonal 0) — see the 2025
-    // repo's pretreating.py: `adjacency = matrix.abs(); adjacency[< st] = 0`.
+    // retained, below-threshold entries zeroed, diagonal 0) — see Eq. 3 and the
+    // 2025 repo's pretreating.py. Binarising produces repeated 0/-1 eigenvalues.
     let mut w = Mat::zeros((g, g));
     for (x, &i) in giant.iter().enumerate() {
         for (y, &j) in giant.iter().enumerate() {
@@ -295,52 +313,51 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
         }
     }
     let (mut lam, _) = linalg::eigh(&w);
-    // The Perron eigenvalue of a weighted matrix is huge and isolated; fitting
-    // the integrated density across it makes the polynomial non-monotone (which
-    // my clipping then turned into zero spacings and blanket rejection).
-    // Unfold the bulk only.
     if cfg.trim_extremes && lam.len() > 10 {
         lam.pop();
         lam.remove(0);
     }
     let (d, _) = unfolded_spacings(&lam);
-    // A near-empty graph yields a handful of spacings and a trivial dof, which
-    // used to "converge" the scan on a 31-node remnant. Require a spectrum large
-    // enough for the GOF to mean anything.
     if d.len() < cfg.min_spacings {
-        return None;
+        return ex(p, edges, "excluded_too_few_spacings", giant_frac);
     }
     let (chi2, dof, crit) = stats::poisson_gof(&d, alpha);
-    // dof < 2 = the spacings could not be resolved into enough bins for the
-    // test to mean anything. Report the point as non-estimable instead of
-    // letting chi2 ~ 0 masquerade as agreement with Poisson.
-    if dof < cfg.min_dof || !chi2.is_finite() {
-        return None;
-    }
     let ks = stats::ks_poisson(&d);
-    Some(ScanPoint {
+    let mut pt = ScanPoint {
         st,
         p,
-        edges: edges_of(&w),
+        edges,
         chi2,
         dof,
         crit,
-        poisson: dof > 0 && chi2 <= crit,
+        poisson: false,
         ks,
         giant_frac,
-    })
+        status: String::new(),
+    };
+    if dof < cfg.min_dof || !chi2.is_finite() {
+        pt.status = "excluded_low_dof".into();
+    } else if chi2 <= crit {
+        pt.status = "accepted".into();
+        pt.poisson = true;
+    } else {
+        pt.status = "rejected_gof".into();
+    }
+    pt
 }
 
 fn scan(s: &Mat, sts: &[f64], min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> Vec<ScanPoint> {
     let mut out: Vec<ScanPoint> = sts
         .par_iter()
-        .filter_map(|&st| evaluate(s, st, min_nodes, alpha, cfg))
+        .map(|&st| evaluate(s, st, min_nodes, alpha, cfg))
         .collect();
     out.sort_by(|a, b| a.st.partial_cmp(&b.st).unwrap());
     out
 }
 
 pub struct RmtResult {
+    /// false when no candidate passed: no adjacency exists and none is invented
+    pub estimable: bool,
     pub st: f64,
     /// true when some threshold was accepted by the GOF
     pub converged: bool,
@@ -367,7 +384,7 @@ pub fn rmt_threshold(s: &Mat, st0: f64, min_nodes: usize, alpha: f64, cfg: &RmtC
     }
     let log_coarse = scan(s, &coarse, min_nodes, alpha, cfg);
 
-    let accepted = log_coarse.iter().find(|p| p.poisson).map(|p| p.st);
+    let accepted = log_coarse.iter().find(|p| p.status == "accepted").map(|p| p.st);
     let (st_final, converged, fallback, log) = match accepted {
         Some(acc) => {
             let lo = (acc - 0.05).max(0.01);
@@ -380,7 +397,7 @@ pub fn rmt_threshold(s: &Mat, st0: f64, min_nodes: usize, alpha: f64, cfg: &RmtC
             let mut log_fine = scan(s, &fine, min_nodes, alpha, cfg);
             let best = log_fine
                 .iter()
-                .find(|p| p.poisson)
+                .find(|p| p.status == "accepted")
                 .map(|p| p.st)
                 .unwrap_or(acc);
             log_fine.extend(log_coarse.iter().cloned());
@@ -389,21 +406,30 @@ pub fn rmt_threshold(s: &Mat, st0: f64, min_nodes: usize, alpha: f64, cfg: &RmtC
             (best, true, false, log_fine)
         }
         None => {
-            // no acceptance: report the closest-to-Poisson point, flagged
-            let best = log_coarse
-                .iter()
-                .min_by(|a, b| {
-                    let ra = a.chi2 / a.crit.max(1e-12);
-                    let rb = b.chi2 / b.crit.max(1e-12);
-                    ra.partial_cmp(&rb).unwrap()
-                })
-                .map(|p| p.st)
-                .unwrap_or_else(|| coarse.last().copied().unwrap_or(0.95));
-            (best, false, true, log_coarse)
+            // No acceptance. Do NOT invent a threshold: there is no graph to
+            // build, and the previous behaviour (pick the least-bad point and
+            // build a network there) produced plausible-looking results that
+            // were not results at all.
+            (f64::NAN, false, true, log_coarse)
         }
     };
 
+    if st_final.is_nan() {
+        return RmtResult {
+            estimable: false,
+            st: f64::NAN,
+            converged: false,
+            fallback: true,
+            log,
+            adjacency: Mat::zeros((0, 0)),
+            kept: Vec::new(),
+            eigenvalues: Vec::new(),
+            spacings: Vec::new(),
+            edges: 0,
+        };
+    }
     let mut r = at_threshold(s, st_final);
+    r.estimable = true;
     r.converged = converged;
     r.fallback = fallback;
     r.log = log;
@@ -434,6 +460,7 @@ pub fn at_threshold(s: &Mat, st: f64) -> RmtResult {
         spacings = d;
     }
     RmtResult {
+        estimable: true,
         st,
         converged: false,
         fallback: false,
@@ -483,10 +510,8 @@ mod tests {
         for i in 0..n {
             full[(i, i)] = 0.0;
         }
-        match evaluate(&full, 0.5, 10, 0.01, &RmtConfig::default()) {
-            Some(pt) => assert!(!pt.poisson, "complete graph must not look Poisson: {pt:?}"),
-            None => {} // a degenerate spectrum may not even be evaluable
-        }
+        let pt = evaluate(&full, 0.5, 10, 0.01, &RmtConfig::default());
+        assert_ne!(pt.status, "accepted", "complete graph must not look Poisson: {pt:?}");
     }
 
     #[test]
@@ -506,8 +531,10 @@ mod tests {
                 s[(j, i)] = v;
             }
         }
-        let pt = evaluate(&s, 0.5, 10, 0.01, &RmtConfig::default()).expect("dense graph should be evaluable");
+        let pt = evaluate(&s, 0.5, 10, 0.01, &RmtConfig::default());
         assert!(pt.p > 10, "kept {} nodes", pt.p);
-        assert!(pt.chi2.is_finite() && pt.dof >= 1, "{pt:?}");
+        // it must at least reach the statistic, even if the dof guard then drops it
+        assert_ne!(pt.status, "excluded_min_nodes", "{pt:?}");
+        assert_ne!(pt.status, "excluded_too_few_spacings", "{pt:?}");
     }
 }

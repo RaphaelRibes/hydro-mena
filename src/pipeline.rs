@@ -229,6 +229,68 @@ pub fn run_pipeline(
         rmt_s
     );
 
+    if !rmt.estimable {
+        eprintln!(
+            "[rmt] NOT ESTIMABLE — {} candidates evaluated, none accepted. \
+             No adjacency, no network, no Fig-5: pass --st <value> to force a threshold.",
+            rmt.log.len()
+        );
+        let report = RunReport {
+            n_otus: abundance.nrows(),
+            n_samples: abundance.ncols(),
+            n_traits: traits.ncols(),
+            gpu_used,
+            input: InputMeta {
+                abundance: opts.abundance_path.clone(),
+                traits: opts.traits_path.clone(),
+                seed: opts.seed,
+                permutations: opts.n_perm,
+                fixed_threshold: opts.fixed_st,
+            },
+            rmt: RmtReport {
+                st: f64::NAN,
+                converged: false,
+                fallback: true,
+                alpha: opts.alpha,
+                n_points: rmt.log.len(),
+                n_kept: 0,
+                edges: 0,
+                scan: rmt.log.clone(),
+            },
+            topology: TopoReport {
+                n: 0, edges: 0, density: f64::NAN, avg_k: f64::NAN, gd: f64::NAN,
+                connected_frac: f64::NAN, n_components: 0, giant_frac: f64::NAN,
+                avg_cc: f64::NAN, modularity: f64::NAN, n_modules: 0,
+                r2_powerlaw: f64::NAN, gamma: f64::NAN, r2_hierarchy: f64::NAN,
+            },
+            modules: ModuleReport {
+                modularity: f64::NAN, n_modules: 0, sizes: Vec::new(),
+                role_counts: std::collections::HashMap::new(),
+            },
+            eigengene_var_explained: Vec::new(),
+            fig5_r: Vec::new(),
+            fig5_p: Vec::new(),
+            fig5_q: Vec::new(),
+            mantel: MantelReport { r: f64::NAN, p: f64::NAN, n_perm: opts.n_perm, r_null_mean: f64::NAN },
+            timing_s: Timing {
+                standardize_s,
+                similarity_s,
+                rmt_s,
+                topology_s: f64::NAN,
+                modules_s: f64::NAN,
+                eigengene_s: f64::NAN,
+                mantel_s: f64::NAN,
+                export_s: 0.0,
+                total_s: t0.elapsed().as_secs_f64(),
+            },
+        };
+        if opts.write_artifacts {
+            write_scan_csv(&opts.out_dir, &rmt.log)?;
+            io::write_json(&opts.out_dir.join("report.json"), &report)?;
+        }
+        return Ok(RunArtifacts { report, adjacency: Mat::zeros((0, 0)), kept_names: Vec::new() });
+    }
+
     // restrict to kept nodes
     let kept = &rmt.kept;
     let p = kept.len();
@@ -388,6 +450,30 @@ pub fn run_pipeline(
     Ok(RunArtifacts { report, adjacency: a, kept_names })
 }
 
+
+/// One row per candidate threshold, including the ones that never produced a
+/// statistic. This file is the audit trail: it must explain a failure, not hide it.
+fn write_scan_csv(out: &Path, log: &[crate::rmt::ScanPoint]) -> Result<()> {
+    let mut w = csv::Writer::from_path(out.join("rmt_scan.csv"))?;
+    w.write_record(["st", "p", "edges", "chi2", "dof", "crit", "poisson", "ks", "giant_frac", "status"])?;
+    for pt in log {
+        w.write_record([
+            format!("{:.4}", pt.st),
+            pt.p.to_string(),
+            pt.edges.to_string(),
+            format!("{:.4}", pt.chi2),
+            pt.dof.to_string(),
+            format!("{:.4}", pt.crit),
+            pt.poisson.to_string(),
+            format!("{:.4}", pt.ks),
+            format!("{:.4}", pt.giant_frac),
+            pt.status.clone(),
+        ])?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_artifacts(
     out: &Path,
@@ -473,24 +559,7 @@ fn write_artifacts(
         w.flush()?;
     }
 
-    // RMT scan trace
-    {
-        let mut w = csv::Writer::from_path(out.join("rmt_scan.csv"))?;
-        w.write_record(["st", "p", "edges", "chi2", "dof", "crit", "poisson", "ks"])?;
-        for pt in &rmt.log {
-            w.write_record([
-                format!("{:.4}", pt.st),
-                pt.p.to_string(),
-                pt.edges.to_string(),
-                format!("{:.4}", pt.chi2),
-                pt.dof.to_string(),
-                format!("{:.4}", pt.crit),
-                pt.poisson.to_string(),
-                format!("{:.4}", pt.ks),
-            ])?;
-        }
-        w.flush()?;
-    }
+    write_scan_csv(out, &rmt.log)?;
 
     // spectrum of the kept graph
     {
