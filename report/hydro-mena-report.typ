@@ -32,7 +32,7 @@
   ]
   #v(0.3em)
   #text(size: 9pt)[
-    Commit `85dc991` · 2026-11-08 · bench on `cachyos-x8664` (Ryzen 7 5800X3D, RTX 2080 Ti)
+    Commit `54c9ac4` · 2026-11-08 · bench on `cachyos-x8664` (Ryzen 7 5800X3D, RTX 2080 Ti)
   ]
 ]
 
