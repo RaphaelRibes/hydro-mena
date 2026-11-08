@@ -148,8 +148,9 @@ pipeline runs 0.0017 s at n=60 and **55.1 s at n=1920**, of which **RMT is
 ~0 s and the eigendecompositions are the whole cost — the bottleneck moved.
 Similarity: CPU 1.499 s vs GPU 1.523 s at n=12000, i.e. **0.98× — parity, not a
 win**, with maxdiff 2.3e-7…7.9e-7 (PASS). The old "4.71× at n=12000" is
-obsolete because the *CPU* path was parallelised (16 threads, ~4.7× faster than
-its own serial baseline), not because the GPU regressed; the GPU still pays a
+obsolete because the *CPU* path was parallelised (16 threads; the ~4.7× vs its
+serial baseline is **inferred** from the old 6.98 s timing and was not re-timed
+here), not because the GPU regressed; the GPU still pays a
 fixed ~0.35 s. Full matrix with provenance in
 `hydro-mena-vault/05-Benchmarks/bench-2026-11-08.md`.
 
