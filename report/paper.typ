@@ -169,6 +169,23 @@ precision = 1.000, recall = 0.929, F1 = 0.963 (mena 836 edges, all inside the
 never ran the RMT scan; the automatic binary-spectrum thresholds found here
 (box 0.680, ox 0.610, anox 0.650) sit in the same range.
 
+A second, independent Rust implementation (Rusty-MENAP, a 400-line prototype
+tested on the control table distributed with Deng et al., 987 OTUs × 14
+samples) failed in the mirror image of our round-1 build: it kept the unit
+diagonal of the similarity matrix as a self-loop, so no isolated node was ever
+removed, its reported edge count was inflated by n/2 (2842 against 2349
+true), and its $chi^2$ acceptance was a normal approximation with
+$"df" = "bins" - 1$. Restoring paper step (d) (zero diagonal, prune isolated
+nodes) and replacing the test with the exact tail and bins merged to
+expectation $>= 5$ moved its transition from 0.84 to 0.86. That is the same
+order of correction
+as the gap between the reference implementation's fixed 0.52 and our automatic
+thresholds, and it is the reason the audit trail, not the point estimate, is
+what we report. The prototype also returns a threshold (0.83) on a
+correlation-free null in which every OTU's values are permuted across samples,
+which is why we treat the scan as a statistic to be controlled and not as
+evidence on its own.
+
 = Results
 
 == "Not estimable" as an artefact of the first build
@@ -358,5 +375,6 @@ graphs are modular, small-world-leaning, scale-free in the Clauset sense, and
 = Availability
 
 Code: github.com/RaphaelRibes/hydro-mena (public, commit `8ae7c7c`, 40/40
-tests). Audit and working notes: private vault mirror. Figures in `report/`
-(png), source `report/paper.typ`.
+tests). The independent prototype discussed above is
+github.com/RaphaelRibes/Rusty-MENAP. Audit and working notes: private vault
+mirror. Figures in `report/` (png), source `report/paper.typ`.
