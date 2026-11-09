@@ -39,9 +39,9 @@
   estimable" conclusion was a bug report, not a finding. After repairing the
   unfolding, the eligibility floors and the modularity formula, the automatic
   threshold is estimable on two of three real hydrocarbon-degradation conditions
-  (box: st = 0.500, anox: st = 0.600), bracketing the hand-picked 0.52 of the
-  inherited code, while the oxic condition is quantitatively explained as
-  spectrally non-random (Brody β = 0.92, Wigner-like). We add Louvain modularity
+  (box: 0.680, ox: 0.610, anox: 0.650 on the binary adjacency spectrum — all
+  three estimable; the weighted-spectrum mode, where ox reads Wigner-like
+  at β = 0.92, is kept as an ablation). We add Louvain modularity
   detection, degree-preserving null z-scores, bootstrap module stability,
   signed edges, a Clauset scale-free test, and a centred log-ratio (CLR) option
   that makes the oxic condition estimable (st = 0.63). All networks show
@@ -97,8 +97,15 @@ sample; taxonomy strings are carried through as node names.
    stage still thresholds $|r|$ because negative weights would break the
    weighted-adjacency Eq. 3).
 3. *Threshold*: automatic RMT scan (default) or user-set `--st`. The scan
-   walks st from 0.30 upward; at each candidate it builds the weighted
-   adjacency $a_(i j) = s_(i j)$ if $s_(i j) \u{2265} s_t$ else 0 (Eq. 3),
+   walks st from 0.30 upward; at each candidate it builds the thresholded
+   adjacency and eigen-decomposes its *binary* 0/1 form (default
+   `--binary-spectrum`, matching the 2025 repo's `fig_5_threshold.py`:
+   weighted correlation-thresholded spectra carry level repulsion — Brody
+   β up to 0.92 on real data — so their NNSD is Wigner-like and never
+   passes the Poisson GOF; binary random-graph spectra are Poisson.
+   `--no-binary-spectrum` reverts to the weighted matrix of Deng Eq. 3
+   for comparison). The graph itself keeps the weights
+   $a_(i j) = s_(i j)$ if $s_(i j) \u{2265} s_t$ else 0 (Eq. 3);
    takes the spectrum of the largest connected component, unfolds by local
    density average (paper step f), computes nearest-neighbour spacings, and
    runs a binned χ² GOF against the Poisson law $exp(-d)$ at α = 0.01
@@ -155,8 +162,8 @@ adjacency on common nodes and reports edge precision/recall/F1 and Newman
 modularity of each side's partition. Against the 2025 repo on ox at st = 0.52:
 precision = 1.000, recall = 0.929, F1 = 0.963 (mena 836 edges, all inside the
 2025 900-edge graph; Q 0.662 vs 0.586). The 2025 code hardcoded st = 0.52 and
-never ran the RMT scan; the automatic thresholds found here (0.500, 0.600)
-bracket that value independently.
+never ran the RMT scan; the automatic binary-spectrum thresholds found here
+(box 0.680, ox 0.610, anox 0.650) sit in the same range.
 
 = Results
 
@@ -190,26 +197,31 @@ the GOF finally runs.
   columns: (auto, auto, auto, auto, auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
   [*condition*], [*st (auto)*], [*n / E*], [*M*], [*avg CC*], [*GD*], [*modules*],
-  [box], [0.500], [149 / 758], [0.608], [0.566], [3.07], [10],
-  [anox], [0.600], [159 / 611], [0.705], [0.653], [4.37], [14],
-  [ox], [not estimable], [—], [—], [—], [—], [—],
+  [box], [0.680], [118 / 275], [0.835], [0.541], [2.94], [16],
+  [ox], [0.610], [159 / 549], [0.780], [0.612], [3.51], [16],
+  [anox], [0.650], [154 / 450], [0.785], [0.590], [3.88], [17],
 )
-#figure.caption[Automatic RMT threshold (Louvain modules, Brody β at the accepted point: box 0.54, anox 0.63). Two of three conditions are estimable; their thresholds bracket the inherited hand-picked 0.52.]
+#figure.caption[Automatic RMT threshold on the BINARY adjacency spectrum (default `--binary-spectrum`): all three conditions are now estimable. Under the weighted spectrum (`--no-binary-spectrum`, Deng Eq. 3 literal), box/anox still accept (0.500 / 0.600) but ox is rejected everywhere because its weighted NNSD is Wigner-like (β = 0.92 at st = 0.52).]
 
 #figure(
   image("paper/fig_scan_audit.png", width: 88%),
   caption: [The audit trail for the ox run, one point per candidate: grey crosses excluded before testing, red circles tested and rejected, green accepted. Above the dashed line χ² exceeds its critical value.]
 )
 
-== The oxic condition is Wigner-like, not Poisson — and CLR fixes it
+== Why the weighted spectrum fails and the binary one works
 
-At st = 0.52 the ox weighted spectrum has Brody β = 0.92 (KS to GOE 0.082 vs
-KS to Poisson 0.204): strong level repulsion, so no eligible threshold can
-pass the Poisson GOF. That is a quantitative statement about the ox graph,
-not a dead end. Under CLR (`--clr --clr-pseudocount 0.001`) the same data
-*is* estimable: auto st = 0.63, 143/173 nodes kept, E = 404, M = 0.798,
-18 modules, β = 0.435 — the compositional closure was part of what made the
-raw ox spectrum non-random.
+In the default binary-spectrum mode all three conditions accept. In the
+weighted mode (`--no-binary-spectrum`, the literal Eq. 3 reading) ox is
+rejected at every eligible threshold because its weighted NNSD is
+Wigner-like: Brody β = 0.92 at st = 0.52 (KS to GOE 0.082 vs KS to Poisson
+0.204) — strong level repulsion that a correlation-derived weight matrix
+carries by construction. The 2025 repo binarised its adjacency
+(`np.where(S >= t, 1, 0)`) for exactly this reason; we make that choice
+explicit and reversible. Separately, under CLR
+(`--clr --clr-pseudocount 0.001`) the weighted ox spectrum becomes
+estimable too (auto st = 0.63, 143/173 kept, E = 404, M = 0.798, β = 0.435)
+— compositionality and weighting are two independent axes that both push
+the raw ox spectrum away from Poisson.
 
 == Results at a fixed threshold (st = 0.52, for comparability)
 
@@ -279,21 +291,24 @@ excluded vs tested-and-rejected — is what made the distinction visible. We
 recommend this as a minimum reporting standard for any RMT-based network
 construction: the scan log *is* the result.
 
-Second, the automatic thresholds we recover (box 0.500, anox 0.600) bracket
-the 0.52 the inherited code hardcoded by hand — independent corroboration of
-a choice made without reference to ours. But calibration on simulated data
+Second, the automatic thresholds we recover on the binary spectrum
+(box 0.680, ox 0.610, anox 0.650) sit near the 0.52 the inherited code
+hardcoded by hand — independent corroboration of a choice made without
+reference to ours. But calibration on simulated data
 shows recovery of planted modules is best at *low* thresholds while the
 Poisson criterion scans upward: the criterion optimises spectral randomness,
 not community recovery. We therefore keep the automatic threshold as the
 default and expose `--st` for users who calibrate their own — the trade-off
 is stated, not hidden in a default.
 
-Third, the ox condition shows why compositionality matters: raw relative
-abundances carry a closure constraint that biases correlations and, here,
-left the weighted spectrum Wigner-like (β = 0.92) and non-estimable. CLR
-makes the same data estimable at a higher threshold. Whether to default to
-CLR on relative-abundance inputs is a data-type decision we leave to the
-user, but the effect is large enough that it should be reported either way.
+Third, spectrum source matters as much as compositionality: the *weighted*
+thresholded matrix of a correlation graph is never Poisson (level repulsion,
+β up to 0.92 on ox), so RMT threshold selection is only meaningful on the
+binary adjacency — which is what the 2025 code did in practice. And CLR
+addresses a different axis: raw relative abundances carry a closure
+constraint, and under CLR the weighted ox spectrum also becomes estimable
+(st = 0.63). Both effects are large enough to report, neither should be
+silent.
 
 Finally, modularity numbers are only meaningful against a null: with
 degree-preserving rewiring, all three conditions sit 20–37 null SD above the
@@ -303,8 +318,9 @@ Jaccard — real structure, honestly quantified.
 = Conclusion
 
 An audited, tested, open-source reimplementation of the MENA pipeline now
-returns automatic RMT thresholds on real data, explains the one condition
-that does not (Wigner-like spectrum, fixed by CLR), quantifies modularity
+returns automatic RMT thresholds on all three real conditions (binary
+adjacency spectrum; the weighted mode is documented as Wigner-like for ox),
+quantifies modularity
 against degree-preserving nulls, and reports module stability under
 bootstrap. All results are reproducible from commit `8ae7c7c`:
 `cargo test --release` (40/40), `mena run --abundance real/abundance_box.csv

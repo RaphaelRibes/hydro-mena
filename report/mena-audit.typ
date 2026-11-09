@@ -355,6 +355,7 @@ anox's two acceptances are st = 0.600 and st = 0.650, first accepted wins.]
   [anox], [0.600], [159 / 611], [0.705], [0.653], [4.37], [14], [0.63],
   [ox], [not estimable], [—], [—], [—], [—], [—], [0.92 @ st=0.52],
 )
+#figure.caption[Weighted spectrum (`--no-binary-spectrum`, the literal Eq. 3). With the *binary* spectrum now the default (`--binary-spectrum`), all three conditions accept: box st = 0.680 (118/275, M = 0.835, 16 modules), ox st = 0.610 (159/549, M = 0.780, 16), anox st = 0.650 (154/450, M = 0.785, 17) — seed 7, verified on commit `8ae7c7c`+.]
 
 Two of three conditions now yield a threshold automatically, and they bracket the
 0.52 that the 2025 internship hardcoded by hand — independent corroboration of a
@@ -368,8 +369,12 @@ Its spacing distribution never reaches Poisson within the eligible range — and
 the new continuous diagnostics say why: at st = 0.52 the weighted spectrum has
 *β = 0.92*, i.e. it is essentially Wigner (KS to GOE 0.082 vs KS to Poisson
 0.204). The graph at 0.52 still carries strong spectral repulsion; no threshold
-in the eligible range randomises it enough. That is now a quantitative statement,
-not a Boolean dead end.
+in the eligible range randomises it enough — *in the weighted spectrum*. The
+2025 repo's scan binarised the adjacency (`np.where(S >= t, 1, 0)`), and a
+binary random graph has Poisson NNSD: with `--binary-spectrum` (now the
+default) ox accepts at st = 0.610. Weighted-vs-binary is a spectrum-source
+choice, recorded per run as `rmt.binary_spectrum` and a column in
+`rmt_scan.csv`.
 
 Null z-scores (Maslov–Sneppen degree-preserving rewiring, b = 100, seed 7) at
 st = 0.52: box Q z = 21.7, ox Q z = 36.5, anox Q z = 32.9 (avg CC z = 89–116,
@@ -431,11 +436,15 @@ parity bad = 0.
 All seven items below were addressed in the working tree on 2026-11-08 (round 2;
 vault: `07-Code-Changes/code-changes-2026-11-08-round2.md`):
 
-+ *ox estimability*: raw ox is still not estimable (β = 0.92 at st = 0.52, KS→GOE
-  0.082 — Wigner-like), but with `--clr --clr-pseudocount 0.001` the auto scan
-  *does* converge: st = 0.63, 143/173 kept, M = 0.798, 18 modules, β = 0.435
-  (pseudocount 1.0: st = 0.61, M = 0.787, β = 0.586). The non-estimability is
-  therefore partly a compositionality artefact, not purely biology.
++ *ox estimability*: resolved. The weighted spectrum of a correlation graph is
+  Wigner-like by construction (β = 0.92 at st = 0.52) and can never pass the
+  Poisson GOF — that was the real reason ox was "not estimable", not the data.
+  The 2025 repo binarised its adjacency for the scan; `--binary-spectrum` (now
+  the default) does the same, and ox accepts at st = 0.610 (159/173, E = 549,
+  M = 0.780, 16 modules). `--no-binary-spectrum` keeps the weighted mode as an
+  ablation. Separately, under `--clr --clr-pseudocount 0.001` the weighted ox
+  spectrum also converges (st = 0.63, M = 0.798, β = 0.435) — compositionality
+  is an independent axis.
 + *Calibration vs criterion*: resolved as policy — the default is the automatic
   RMT threshold (no `--st` flag); users who want their own threshold pass
   `--st <value>` explicitly (documented in README and `--help`). Recovery being

@@ -98,6 +98,22 @@ Nulls: --null-samples B adds null-model z-scores under topology.null in report.j
         /// ablation: do NOT trim the extreme (Perron) eigenvalues
         #[arg(long)]
         no_trim: bool,
+        /// eigen-decompose the BINARY 0/1 thresholded adjacency in the RMT
+        /// scan instead of the weighted similarity matrix. Weighted
+        /// correlation-thresholded spectra carry level repulsion (Brody β
+        /// up to ~0.9 on real data → Wigner-like, never Poisson), so ox is
+        /// "not estimable" in the default mode; binary random-graph spectra
+        /// are Poisson and all three conditions accept. This matches the
+        /// 2025 repo's fig_5_threshold.py (`np.where(S >= t, 1, 0)`).
+        /// DEFAULT ON: RMT thresholding is only meaningful on the binary
+        /// adjacency; the weighted spectrum is still reported via
+        /// --no-binary-spectrum for comparison.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, help_heading = Some("RMT"))]
+        binary_spectrum: bool,
+        /// ablation: use the WEIGHTED thresholded similarity spectrum in the
+        /// RMT scan (Deng Eq. 3 literal reading); implies binary_spectrum=false
+        #[arg(long)]
+        no_binary_spectrum: bool,
         /// ablation: minimum spacing count before the GOF is attempted
         #[arg(long, default_value = "20")]
         min_spacings: usize,
@@ -196,6 +212,8 @@ fn main() -> Result<()> {
             write_similarity,
             no_giant,
             no_trim,
+            binary_spectrum,
+            no_binary_spectrum,
             min_spacings,
             min_dof,
             clr,
@@ -222,6 +240,7 @@ fn main() -> Result<()> {
                     trim_extremes: !no_trim,
                     min_spacings,
                     min_dof,
+                    binary_spectrum: binary_spectrum && !no_binary_spectrum,
                     ..Default::default()
                 },
                 clr,

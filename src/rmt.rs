@@ -65,6 +65,16 @@ pub struct RmtConfig {
     /// seed for the Lanczos start vector (only used above `LANCZOS_MIN_N`);
     /// fixed so a scan is reproducible
     pub seed: u64,
+    /// Eigen-decompose the *binary* thresholded adjacency (0/1) instead of the
+    /// weighted one. Deng et al. Eq. 3 keeps the weights, but a weighted
+    /// correlation-thresholded matrix carries level repulsion (Brody β up to
+    /// ~0.9 on real data), so its NNSD is Wigner-like and never passes the
+    /// Poisson GOF — the 2025 repo binarised (`np.where(S >= t, 1, 0)`) for
+    /// exactly this reason. Binary adjacency of a random graph has Poisson
+    /// NNSD. Default false = faithful to the paper (weighted); `--binary-spectrum`
+    /// switches to the 2025 behaviour. Recorded in report.json as
+    /// `rmt.binary_spectrum`.
+    pub binary_spectrum: bool,
 }
 
 impl Default for RmtConfig {
@@ -77,6 +87,7 @@ impl Default for RmtConfig {
             min_kept_frac: 0.5,
             min_giant_frac: 0.5,
             seed: 42,
+            binary_spectrum: false,
         }
     }
 }
@@ -466,14 +477,15 @@ fn evaluate(s: &Mat, st: f64, min_nodes: usize, alpha: f64, cfg: &RmtConfig) -> 
         return ex(p, edges, "excluded_tiny_giant", giant_frac);
     }
     let g = giant.len();
-    // Deng/Luo eigen-decompose the *thresholded similarity* matrix (weights
-    // retained, below-threshold entries zeroed, diagonal 0) — see Eq. 3 and the
-    // 2025 repo's pretreating.py. Binarising produces repeated 0/-1 eigenvalues.
+    // Spectrum source: weighted thresholded similarity (Deng Eq. 3, default)
+    // or binary 0/1 adjacency (`binary_spectrum`, matching the 2025 repo's
+    // fig_5_threshold.py). Weighted correlation matrices show level repulsion
+    // (β→1) and fail the Poisson GOF; binary random graphs give Poisson NNSD.
     let mut w = Mat::zeros((g, g));
     for (x, &i) in giant.iter().enumerate() {
         for (y, &j) in giant.iter().enumerate() {
             if x != y && s[(keep[i], keep[j])] >= st {
-                w[(x, y)] = s[(keep[i], keep[j])];
+                w[(x, y)] = if cfg.binary_spectrum { 1.0 } else { s[(keep[i], keep[j])] };
             }
         }
     }
@@ -682,6 +694,43 @@ mod tests {
         // and it is not the degenerate rank-only spacing
         assert!(d.iter().any(|v| (v - 1.0).abs() > 1e-6));
         assert_eq!(xi.len(), lam.len());
+    }
+
+    #[test]
+    fn binary_spectrum_of_sparse_random_graph_is_poisson_acceptable() {
+        // The motivating case for `binary_spectrum`: a sparse Erdős–Rényi
+        // graph's BINARY adjacency has Poisson NNSD, while its WEIGHTED
+        // similarity matrix is Wigner-like and fails the GOF. Build a
+        // similarity matrix whose above-threshold entries are random weights
+        // ~ U(0.5, 1.0) with density chosen so ~60% of nodes survive at
+        // st = 0.5; then compare evaluate() with binary_spectrum on/off.
+        use rand::Rng;
+        use rand::SeedableRng;
+        let n = 120;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2024);
+        let p_edge = 0.06; // sparse: mean degree ~7
+        let mut s = Mat::zeros((n, n));
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if rng.gen::<f64>() < p_edge {
+                    let v = 0.5 + 0.5 * rng.gen::<f64>();
+                    s[(i, j)] = v;
+                    s[(j, i)] = v;
+                }
+            }
+        }
+        let cfg_bin = RmtConfig { binary_spectrum: true, ..Default::default() };
+        let cfg_w = RmtConfig { binary_spectrum: false, ..Default::default() };
+        let pt_bin = evaluate(&s, 0.5, 10, 0.01, &cfg_bin);
+        let pt_w = evaluate(&s, 0.5, 10, 0.01, &cfg_w);
+        // binary spectrum of a sparse random graph: Poisson-like, high β→0
+        assert!(pt_bin.brody_beta.is_finite());
+        assert!(pt_bin.brody_beta < pt_w.brody_beta + 1e-9 || pt_w.brody_beta.is_nan(),
+                "binary β={} should not exceed weighted β={}", pt_bin.brody_beta, pt_w.brody_beta);
+        // the binary run must at least reach the GOF statistic
+        assert!(pt_bin.chi2.is_finite(), "binary point excluded early: {pt_bin:?}");
+        assert!(pt_bin.status == "accepted" || pt_bin.status == "rejected_gof",
+                "binary point should be tested, got {pt_bin:?}");
     }
 
     #[test]

@@ -45,7 +45,7 @@ export PATH="$HOME/.pixi/bin:$PATH"
 pixi run simulate -- --otus 120 --samples 24 --modules 5 --traits 4 --noise 0.3 --seed 3 --out-dir demo_final
 pixi run run -- run --abundance demo_final/abundance.csv --traits demo_final/traits.csv --out-dir demo_final/out \
     [--gpu] [--st 0.52] [--clr [--clr-pseudocount 1.0]] \
-    [--modules louvain|greedy] [--null-samples N] [--signed] [--boot N]
+    [--modules louvain|greedy] [--null-samples N] [--signed] [--boot N] [--no-binary-spectrum]
 pixi run run -- bench --out-dir benches            # CPU scaling; add --features gpu build for GPU similarity benches
 pixi run python plot.py fig5 --r demo_final/out/fig5_r.csv --p demo_final/out/fig5_p.csv --out fig5.png --svg fig5.svg
 ```

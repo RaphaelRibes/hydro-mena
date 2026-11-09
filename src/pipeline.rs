@@ -80,6 +80,9 @@ pub struct RmtReport {
     pub n_kept: usize,
     pub edges: usize,
     pub scan: Vec<crate::rmt::ScanPoint>,
+    /// true when the spectrum was taken on the binary 0/1 adjacency
+    /// (`RmtConfig::binary_spectrum`) instead of the weighted matrix
+    pub binary_spectrum: bool,
 }
 
 #[derive(Serialize)]
@@ -367,6 +370,7 @@ pub fn run_pipeline(
                 n_kept: 0,
                 edges: 0,
                 scan: rmt.log.clone(),
+                binary_spectrum: opts.rmt_cfg.binary_spectrum,
             },
             topology: TopoReport {
                 n: 0, edges: 0, density: f64::NAN, avg_k: f64::NAN, gd: f64::NAN,
@@ -402,7 +406,7 @@ pub fn run_pipeline(
             },
         };
         if opts.write_artifacts {
-            write_scan_csv(&opts.out_dir, &rmt.log)?;
+            write_scan_csv(&opts.out_dir, &rmt.log, opts.rmt_cfg.binary_spectrum)?;
             io::write_json(&opts.out_dir.join("report.json"), &report)?;
         }
         return Ok(RunArtifacts { report, adjacency: Mat::zeros((0, 0)), kept_names: Vec::new() });
@@ -539,6 +543,7 @@ pub fn run_pipeline(
             n_kept: p,
             edges: rmt.edges,
             scan: rmt.log.clone(),
+            binary_spectrum: opts.rmt_cfg.binary_spectrum,
         },
         topology: TopoReport {
             n: topo.n,
@@ -616,6 +621,7 @@ pub fn run_pipeline(
         &module_names,
         opts.write_similarity,
         opts.signed,
+        opts.rmt_cfg.binary_spectrum,
     )?;
     let export_s = t.elapsed().as_secs_f64();
 
@@ -630,11 +636,11 @@ pub fn run_pipeline(
 
 /// One row per candidate threshold, including the ones that never produced a
 /// statistic. This file is the audit trail: it must explain a failure, not hide it.
-fn write_scan_csv(out: &Path, log: &[crate::rmt::ScanPoint]) -> Result<()> {
+fn write_scan_csv(out: &Path, log: &[crate::rmt::ScanPoint], binary_spectrum: bool) -> Result<()> {
     let mut w = csv::Writer::from_path(out.join("rmt_scan.csv"))?;
     w.write_record([
         "st", "p", "edges", "chi2", "dof", "crit", "poisson", "ks", "brody_beta", "ks_goe",
-        "giant_frac", "status",
+        "giant_frac", "status", "binary_spectrum",
     ])?;
     for pt in log {
         w.write_record([
@@ -654,6 +660,7 @@ fn write_scan_csv(out: &Path, log: &[crate::rmt::ScanPoint]) -> Result<()> {
             format!("{:.4}", pt.ks_goe),
             format!("{:.4}", pt.giant_frac),
             pt.status.clone(),
+            binary_spectrum.to_string(),
         ])?;
     }
     w.flush()?;
@@ -676,6 +683,7 @@ fn write_artifacts(
     module_names: &[String],
     write_similarity: bool,
     signed: bool,
+    binary_spectrum: bool,
 ) -> Result<()> {
     if write_similarity {
         io::write_csv_matrix(&out.join("similarity.csv"), s, otu_names, otu_names, "OTU")?;
@@ -748,7 +756,7 @@ fn write_artifacts(
         w.flush()?;
     }
 
-    write_scan_csv(out, &rmt.log)?;
+    write_scan_csv(out, &rmt.log, binary_spectrum)?;
 
     // spectrum of the kept graph
     {
