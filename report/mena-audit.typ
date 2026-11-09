@@ -175,24 +175,24 @@ Benchmarks run on the desktop over Tailscale, min-of-3, artifacts disabled.
 #table(
   columns: (auto, auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
-  [*n × m*], [*pipeline*], [*CPU similarity*], [*GPU similarity (old kernel)*], [*GPU (new kernel, warm)*],
-  [240 × 24], [0.043 s], [0.00017 s], [0.376 s], [~0.05 s],
-  [960 × 32], [1.22 s], [0.0018 s], [0.357 s], [~0.06 s],
-  [1920 × 48], [55.06 s], [0.0100 s], [0.382 s], [~0.09 s],
-  [8000 × 96], [—], [—], [0.566 s], [0.24 s],
-  [12000 × 128], [—], [1.499 s], [1.038–1.523 s], [*0.53 s* (2.9× vs old warm)],
+  [*n × m*], [*pipeline*], [*CPU similarity (rayon)*], [*GPU similarity RTX 2080 Ti (wgpu, min-of-3)*],
+  [240 × 24], [—], [0.0001 s], [*0.0018 s*],
+  [960 × 32], [—], [0.0016 s], [*0.0030 s*],
+  [1920 × 48], [0.362 s], [0.0091 s], [*0.0130 s*],
+  [8000 × 96], [—], [0.2946 s], [*0.2202 s*],
+  [12000 × 128], [—], [0.8216 s], [*0.4858 s* (1.69×)],
 )
 
-The inherited claim of a 4.71× GPU win at n = 12000 was obsolete because the CPU
-path was parallelised, not because the GPU regressed. The kernel itself was then
-also rewritten (16×16 tiles, `vec4` shared-memory staging, single submit, cached
-adapter/pipeline): warm GPU similarity at n = 12000 went from 1.04–1.52 s to
-*0.53 s* — now 2.8× faster than the CPU (1.499 s) — with parity preserved
-(maxdiff ≤ 3.8×10⁻⁷, `parity_3000` bad = 0). First call per process still pays
-~0.15–0.25 s of device init. The bottleneck on the CPU pipeline moved to the RMT
-stage: at n = 1920 it was 55.0 s of the 55.06 s total; for giant components above
-512 nodes the scan now uses a Lanczos bulk spectrum, which cut the RMT stage at
-n = 1200 from 12.76 s to *0.41 s* with an identical scan verdict.
+Re-benchmarked 2026-11-09 on the desktop with a fresh `--features gpu` build
+(adapter: NVIDIA GeForce RTX 2080 Ti, Vulkan), `mena bench --gpu`, min-of-3:
+GPU similarity is slower than rayon CPU below n ≈ 3000 (launch overhead), then
+wins: 1.34× at n = 8000, **1.69× at n = 12 000 (0.486 s vs 0.822 s)**; warm
+repeats at n = 12 000: 0.4890 / 0.4845 / 0.4856 s. Parity preserved at every
+size: maxdiff ≤ 3.84×10⁻⁷, bad(>1e-5) = 0 (`parity_3000` maxdiff 2.64×10⁻⁷).
+The earlier 2.8× / 0.53 s figure was measured against the pre-rayon CPU path;
+the honest current number against rayon CPU is 1.69×. The bottleneck on the CPU
+pipeline is the RMT stage (0.351 s of 0.362 s at n = 1920); the Lanczos bulk
+spectrum above 512 nodes cut it at n = 1200 from 12.76 s to *0.41 s*.
 
 = The threshold problem
 
@@ -426,10 +426,11 @@ degree-preserving null z-scores into `report.json`, the RMT scan CSV gains
 `brody_beta` and `ks_goe` (ox at st = 0.52: β = 0.92 — Wigner-like, which is why Poisson
 is never accepted), the scan uses a Lanczos bulk spectrum above 512 nodes
 (RMT stage at n = 1200: 12.76 s → 0.41 s), and the wgpu kernel was rewritten
-(16×16 tiles, `vec4` staging: n = 12000 warm 1.52 s → 0.53 s, 2.8× faster than
-CPU, parity maxdiff ≤ 3.8×10⁻⁷). Verified on the merged tree:
-`cargo test --release` 40/40, GPU build + examples clean on the desktop,
-parity bad = 0.
+(16×16 tiles, `vec4` staging: n = 12000 warm 0.486 s vs rayon CPU 0.822 s =
+1.69×, parity maxdiff ≤ 3.84×10⁻⁷, bad = 0; re-measured 2026-11-09 on the
+RTX 2080 Ti with a fresh gpu build). Verified on the merged tree:
+`cargo test --release` 41/41, GPU build + examples clean on the desktop,
+`cargo test --release --features gpu --lib` 40/40.
 
 = What remains
 

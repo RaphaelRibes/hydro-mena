@@ -147,9 +147,11 @@ similarity matrix; Python only for plotting. 40/40 unit and end-to-end tests
 accepting exponential and rejecting flat spacings, Clauset recovering γ on a
 synthetic power law and rejecting an exponential tail, bootstrap plumbing,
 Mantel on a planted correlation). CPU/GPU parity is exact at every tested size
-(`parity_3000` maxdiff $2.6 \u{D7} 10^(-7)$, bad = 0); the rewritten GPU kernel
-(16×16 tiles, `vec4` staging) is 2.8× faster than CPU at n = 12 000 (0.53 s
-warm vs 1.499 s). For giant components above 512 nodes the scan uses a
+(`parity_3000` maxdiff $2.6 \u{D7} 10^(-7)$, bad = 0); the GPU kernel
+(16×16 tiles, `vec4` staging) on an RTX 2080 Ti is 1.69× faster than
+rayon CPU at n = 12 000 (0.486 s vs 0.822 s, min-of-3, warm repeats
+0.4890/0.4845/0.4856 s); parity maxdiff ≤ 3.84×10⁻⁷ with bad = 0 at every
+size up to n = 12 000. For giant components above 512 nodes the scan uses a
 Lanczos bulk spectrum (top 60 Ritz values), cutting the RMT stage at n = 1200
 from 12.76 s to 0.41 s. Benchmarks: min-of-3 on a Ryzen 7 5800X3D + RTX 2080
 Ti desktop. Caveat: above 512 nodes β/KS read the spectral tail only, so β is
@@ -270,17 +272,17 @@ the raw ox spectrum away from Poisson.
 
 #figure(
   image("paper/fig_bench.png", width: 100%),
-  caption: [CPU scaling and CPU/GPU timing. GPU parity is exact (maxdiff ≤ 7.9×10⁻⁷); the rewritten kernel is 2.8× faster than CPU at n = 12 000 warm (0.53 s vs 1.499 s). The CPU pipeline bottleneck is the RMT stage (55.0 s of 55.06 s at n = 1920), cut to 0.41 s at n = 1200 by the Lanczos bulk spectrum.]
+  caption: [CPU scaling and CPU/GPU timing. GPU parity maxdiff ≤ 3.84×10⁻⁷, bad = 0 at every size; the GPU kernel is 1.69× faster than CPU at n = 12 000 (0.486 s vs 0.822 s min-of-3). The CPU pipeline bottleneck is the RMT stage (0.351 s of 0.362 s at n = 1920), cut by the Lanczos bulk spectrum above 512 nodes.]
 )
 
 #table(
-  columns: (auto, auto, auto, auto),
+  columns: (auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
-  [*n × m*], [*CPU similarity*], [*GPU old kernel*], [*GPU new kernel (warm)*],
-  [240 × 24], [0.00017 s], [0.376 s], [~0.05 s],
-  [1920 × 48], [0.0100 s], [0.382 s], [~0.09 s],
-  [8000 × 96], [—], [0.566 s], [0.24 s],
-  [12000 × 128], [1.499 s], [1.038–1.523 s], [*0.53 s*],
+  [*n × m*], [*CPU similarity (rayon)*], [*GPU RTX 2080 Ti (wgpu, min-of-3)*],
+  [240 × 24], [0.0001 s], [0.0018 s],
+  [1920 × 48], [0.0091 s], [0.0130 s],
+  [8000 × 96], [0.2946 s], [0.2202 s],
+  [12000 × 128], [0.8216 s], [*0.4858 s*],
 )
 
 = Discussion
