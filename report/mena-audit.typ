@@ -436,9 +436,11 @@ vault: `07-Code-Changes/code-changes-2026-11-08-round2.md`):
   *does* converge: st = 0.63, 143/173 kept, M = 0.798, 18 modules, β = 0.435
   (pseudocount 1.0: st = 0.61, M = 0.787, β = 0.586). The non-estimability is
   therefore partly a compositionality artefact, not purely biology.
-+ *Calibration vs criterion*: still a policy choice, not a bug — recovery is best
-  at low st while the criterion selects higher ones. Layer-3 policy (pick st from
-  calibration once) remains a documented option, deliberately not the default.
++ *Calibration vs criterion*: resolved as policy — the default is the automatic
+  RMT threshold (no `--st` flag); users who want their own threshold pass
+  `--st <value>` explicitly (documented in README and `--help`). Recovery being
+  best at low st while the criterion selects higher ones is reported alongside
+  both, so the trade-off stays visible rather than hidden in a default.
 + *Lanczos tail bias*: unchanged caveat — above 512 nodes β/KS read only the top
   60 Ritz values; do not compare β across the 512 boundary.
 + *Bootstrap stability*: `--boot N` added. box at st = 0.52: mean Jaccard 0.398
