@@ -26,7 +26,7 @@
   #v(0.2em)
   #text(size: 10.5pt, style: "italic")[
     A Rust implementation of RMT-based molecular ecological network analysis —
-    what was broken, what was fixed, and what the fixed estimator now says
+    what the first build got wrong, what was repaired, and what the repaired estimator now says
   ]
   #v(0.3em)
   #text(size: 9pt)[
@@ -36,10 +36,11 @@
 
 #v(0.6em)
 #block(stroke: 0.5pt + rgb("#b08968"), fill: rgb("#fdf6ec"), inset: 8pt, radius: 3pt)[
-  *Scope and honesty statement.* This report documents an audit of an inherited
-  tool, and a correction to the audit itself. An earlier version concluded that no
-  threshold was estimable on the real data. That conclusion was wrong, for an
-  instructive reason: the goodness-of-fit test was never actually executed.
+  *Scope and honesty statement.* This report documents an audit of our round-1
+  build (which carried results reported by the 2025 code), and a correction to the
+  audit itself. An earlier version concluded that no threshold was estimable on the
+  real data. That conclusion was wrong, for an instructive reason: the round-1
+  goodness-of-fit test was never actually executed.
   Section 7 shows how the artefact was found and what the estimator says once it
   works.
 ]
@@ -53,7 +54,7 @@ eigengenes and correlate them with environmental traits (the paper's Figure 5).
 The implementation is Rust (rayon CPU, optional wgpu GPU); Python is used only for
 plotting.
 
-The tool was inherited with reported results. The audit's job was to establish
+Reported results existed from the 2025 code; our round-1 build reproduced them, and the audit's job was to check the estimator itself, which
 whether those results were real before they were used.
 
 = Architecture
@@ -75,7 +76,7 @@ whether those results were real before they were used.
     numbers; the plotting layer and GUI read artifacts and cannot disagree with the CLI.]
 )
 
-= Pipeline and where it failed
+= Pipeline and where the first build failed
 
 #figure(
   canvas({
@@ -88,14 +89,14 @@ whether those results were real before they were used.
     node(15.7, y, 2.5, 0.9, [eigengenes\ Fig. 5], rgb("#f6e7d0"), fs: 6.5pt)
     arrow((2.95, y), (3.25, y)); arrow((5.75, y), (6.05, y)); arrow((8.55, y), (8.85, y))
     arrow((11.35, y), (11.65, y)); arrow((14.15, y), (14.45, y))
-    draw.content((7.3, 2.25), text(size: 6.5pt, fill: rgb("#a33"))[two defects])
+    draw.content((7.3, 2.25), text(size: 6.5pt, fill: rgb("#a33"))[two round-1 defects])
     draw.content((10.1, 2.25), text(size: 6.5pt, fill: rgb("#a33"))[inflated Q])
   }),
-  caption: [Pipeline stages. The RMT stage carried two independent defects (red)
+  caption: [Pipeline stages. The RMT stage carried two independent round-1 defects (red)
     and modularity was inflated (red); both contaminated every downstream number.]
 )
 
-= Defects found
+= What the first build got wrong
 
 == The RMT stage was first a no-op, then blind
 
@@ -109,7 +110,7 @@ d.push(p as f64 * (e[i + 1] - e[i]));   // == 1.0 for every i
 Every spacing was exactly 1, so the χ² statistic was exactly 0 for any graph and
 the scan accepted its first candidate — the complete graph.
 
-Repairing that revealed a second, quieter defect. The scan was built on
+Repairing that revealed a second, quieter failure of the same stage. The scan was built on
 `filter_map`, so a candidate that produced no statistic simply vanished:
 
 ```rust
@@ -132,7 +133,7 @@ from *the guards rejected the data*. Section 7 is the story of that distinction.
   [power-law γ], [−42.4], [0.17 (R² = 0.02, no power law)],
   [node roles], [200 × "connector"], [mixed],
 )
-#figure.caption[The "before" column is a 200-OTU simulated run under the broken rank
+#figure.caption[The "before" column is a 200-OTU simulated run under the round-1 rank-only unfolding
 unfolding (saturated graph: γ = −42, 100 % connectors). The "after" column is the
 fixed build on the real box condition at its automatic threshold; on the same 200-OTU
 simulation the fixed build rejects every candidate as not estimable at these floors
@@ -145,21 +146,21 @@ in one community the correct value is 0; the implementation returned 1/n.
 Corrected to $Q = sum_c (L_c / 2E - (d_c / 2E)^2)$ with known-answer tests. Every
 reported modularity fell; `ox` went from 0.705 to 0.650.
 
-== Other defects
+== Other round-1 issues
 
 #table(
   columns: (0.4fr, 2.3fr, 2.2fr),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt, align: (left, left, left),
-  [*No.*], [*defect*], [*status*],
+  [*No.*], [*issue*], [*status*],
   [1], [GPU matrix computed, then discarded and recomputed on CPU while reporting `gpu_used = true`], [fixed],
   [2], [trait table missing a sample silently returned fewer rows, misaligning every correlation], [fixed, hard error],
   [3], [Mantel permuted pair vectors instead of node labels, inflating significance], [fixed],
   [4], [Jacobi eigensolver rescanned the matrix per rotation, 200 rotations total], [replaced by implicit QR],
   [5], [clustering O(k³), modularity O(n²) per move, serial O(n²m) similarity], [O(k²), O(E), parallel],
   [6], [benchmark ran a stale copy of the pipeline], [now calls `run_pipeline`],
-  [7], [`cargo test` broken on a default checkout by feature-gated examples; stale `hydro_mena` imports in examples after the crate rename], [fixed, 19 tests],
+  [7], [`cargo test` broken on our default checkout by feature-gated examples; stale `hydro_mena` imports in examples after the crate rename], [fixed, 19 tests],
   [8], [Fig-5 panel selected traits by significance, i.e. cherry-picking under multiplicity], [ranks by effect size],
-  [9], [commits landed with a broken test build (twice)], [pre-commit build+test gate],
+  [9], [our commits landed with a broken test build (twice)], [pre-commit build+test gate],
 )
 
 = Performance
@@ -394,7 +395,7 @@ the new continuous diagnostics say why: at st = 0.52 the weighted spectrum has
 *β = 0.92*, i.e. it is essentially Wigner (KS to GOE 0.082 vs KS to Poisson
 0.204). The graph at 0.52 still carries strong spectral repulsion; no threshold
 in the eligible range randomises it enough — *in the weighted spectrum*. The
-2025 repo's scan binarised the adjacency (`np.where(S >= t, 1, 0)`), and a
+reference implementation binarises the scan spectrum (`np.where(S >= t, 1, 0)`), and a
 binary random graph has Poisson NNSD: with `--binary-spectrum` (now the
 default) ox accepts at st = 0.610. Weighted-vs-binary is a spectrum-source
 choice, recorded per run as `rmt.binary_spectrum` and a column in
@@ -464,7 +465,7 @@ vault: `07-Code-Changes/code-changes-2026-11-08-round2.md`):
 + *ox estimability*: resolved. The weighted spectrum of a correlation graph is
   Wigner-like by construction (β = 0.92 at st = 0.52) and can never pass the
   Poisson GOF — that was the real reason ox was "not estimable", not the data.
-  The 2025 repo binarised its adjacency for the scan; `--binary-spectrum` (now
+  The reference implementation binarises the scan adjacency; `--binary-spectrum` (now
   the default) does the same, and ox accepts at st = 0.610. Fresh full runs on
   `707c3b6` (seed 7): 159/173 kept, E = 549, M = 0.780, 16 modules, boot mean
   Jaccard 0.414, Clauset γ = 2.22 (p = 1.00), Q-z = 24.9 (b = 100 nulls).
@@ -490,7 +491,7 @@ vault: `07-Code-Changes/code-changes-2026-11-08-round2.md`):
   γ = 2.09 (p = 0.97) — all three degree tails are consistent with a power law,
   contradicting the old OLS R² ≈ 0.02–0.06 reading.
 + *iNAP 2.0 comparison*: `tools/compare_inap.py` (self-test included) diffs a mena
-  run against an iNAP export or the 2025 reference repo. Against the 2025 repo on
+  run against an iNAP export or the reference implementation. Comparison on
   ox: precision = 1.000, recall = 0.929, F1 = 0.963 (mena 836 edges, all inside the
   2025 900-edge graph; Q mena 0.662 vs 2025 0.586).
 
