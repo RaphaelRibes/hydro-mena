@@ -10,7 +10,7 @@
 > been recomputed; the §2 comparison table and the `--st 0.52` values below
 > supersede the first-pass numbers. The corrected figures are **lower** than
 > first reported (ox 0.650, not 0.705), which strengthens rather than weakens
-> the "the RMT stage was broken" conclusion.
+> the round-1 "RMT stage failed" conclusion.
 
 Scope: the `hydro-mena` Rust CLI (`~/hermes_scratch/hydro-mena`), the vault that
 documents it (`hydro-mena-vault`), and the processes that produce its numbers.
@@ -49,7 +49,7 @@ the negative claim: the old statistic was identically zero and accepted any
 graph, including the complete one.
 
 A negative γ and 100 % connectors are the tell: every downstream stage was
-reading a saturated graph. This is why the 2025 repo's author hardcoded 0.52 and
+reading a saturated graph. This is why the reference implementation uses a fixed 0.52 and
 why `--st` had to be added; the root cause was never the data.
 
 Fixed by implementing what the paper specifies: fit the integrated density
@@ -76,7 +76,7 @@ remnant passing a goodness-of-fit test means little, so no threshold-dependent
 claim should be published from this build. `rmt_scan.csv` now records `dof` and
 per-point χ² so low-power points are visible.
 
-Against the 2025 repo's reference network (`adjacency_matrix_ox.csv`,
+Against the reference network (`adjacency_matrix_ox.csv`,
 `data/network_indexes_ox.json`):
 
 | | repo | ours @ st=0.52 (fixed) | ours (RMT scan) |
@@ -96,7 +96,7 @@ aggregate form, so this comparison is now apples-to-apples and the gap is real
 The unpinned RMT scan converges at st=0.70 and returns a much sparser graph
 (361 edges), so it is **not** comparable to the repo's fixed-0.52 network.
 
-## 3. Other defects found
+## 3. Other issues found (round 1)
 
 | # | Where | Problem | Status |
 |---|---|---|---|
