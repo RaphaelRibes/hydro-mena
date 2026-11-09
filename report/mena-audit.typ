@@ -183,12 +183,14 @@ Benchmarks run on the desktop over Tailscale, min-of-3, artifacts disabled.
   [12000 × 128], [—], [0.8216 s], [*0.4858 s* (1.69×)],
 )
 
-Re-benchmarked 2026-11-09 on the desktop with a fresh `--features gpu` build
-(adapter: NVIDIA GeForce RTX 2080 Ti, Vulkan), `mena bench --gpu`, min-of-3:
-GPU similarity is slower than rayon CPU below n ≈ 3000 (launch overhead), then
-wins: 1.34× at n = 8000, **1.69× at n = 12 000 (0.486 s vs 0.822 s)**; warm
-repeats at n = 12 000: 0.4890 / 0.4845 / 0.4856 s. Parity preserved at every
-size: maxdiff ≤ 3.84×10⁻⁷, bad(>1e-5) = 0 (`parity_3000` maxdiff 2.64×10⁻⁷).
+Re-benchmarked twice on 2026-11-09 on the desktop with a fresh `--features gpu`
+build (adapter: NVIDIA GeForce RTX 2080 Ti, Vulkan, driver 615.78.08),
+`mena bench --gpu`, min-of-3 — two independent runs agree: GPU similarity is
+slower than rayon CPU below n ≈ 3000 (launch overhead), then wins: 1.34× at
+n = 8000, **1.68–1.69× at n = 12 000 (0.486–0.490 s vs 0.822–0.823 s)**; warm
+repeats at n = 12 000: 0.4890 / 0.4845 / 0.4856 / 0.4902 s. Parity preserved at
+every size: maxdiff ≤ 3.84×10⁻⁷, bad(>1e-5) = 0 (`parity_3000` maxdiff
+2.64×10⁻⁷, bad = 0/9 000 000).
 The earlier 2.8× / 0.53 s figure was measured against the pre-rayon CPU path;
 the honest current number against rayon CPU is 1.69×. The bottleneck on the CPU
 pipeline is the RMT stage (0.351 s of 0.362 s at n = 1920); the Lanczos bulk
