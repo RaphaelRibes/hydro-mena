@@ -45,7 +45,8 @@
   detection, degree-preserving null z-scores, bootstrap module stability,
   signed edges, a Clauset scale-free test, and a centred log-ratio (CLR) option
   that makes the oxic condition estimable (st = 0.63). All networks show
-  modularity 20–37 null standard deviations above degree-matched random graphs.
+  modularity 20–31 null SD above degree-matched random graphs (b = 100) and
+  bootstrap module stability 0.35–0.45 mean Jaccard.
   The implementation is open source, 40/40 tests, with an exact CPU/GPU parity
   and a GPU path 2.8× faster than CPU at n = 12 000.
 ]]
@@ -197,11 +198,11 @@ the GOF finally runs.
   columns: (auto, auto, auto, auto, auto, auto, auto),
   stroke: 0.4pt + rgb("#ccd3da"), inset: 4.5pt,
   [*condition*], [*st (auto)*], [*n / E*], [*M*], [*avg CC*], [*GD*], [*modules*],
-  [box], [0.680], [118 / 275], [0.835], [0.541], [2.94], [16],
-  [ox], [0.610], [159 / 549], [0.780], [0.612], [3.51], [16],
-  [anox], [0.650], [154 / 450], [0.785], [0.590], [3.88], [17],
+  [box], [0.680], [118 / 275], [0.835], [0.637], [5.82], [16],
+  [ox], [0.610], [159 / 549], [0.780], [0.667], [4.85], [16],
+  [anox], [0.650], [154 / 450], [0.785], [0.633], [5.52], [17],
 )
-#figure.caption[Automatic RMT threshold on the BINARY adjacency spectrum (default `--binary-spectrum`): all three conditions are now estimable. Under the weighted spectrum (`--no-binary-spectrum`, Deng Eq. 3 literal), box/anox still accept (0.500 / 0.600) but ox is rejected everywhere because its weighted NNSD is Wigner-like (β = 0.92 at st = 0.52).]
+#figure.caption[Automatic RMT threshold on the BINARY adjacency spectrum (default `--binary-spectrum`), seed 7, fresh runs on commit `707c3b6`: all three conditions estimable. Same runs with `--null-samples 100` give Q-z 31.5 / 24.9 / 20.1; `--boot 20` gives mean module Jaccard 0.346 / 0.414 / 0.446; Clauset γ = 1.86 / 2.22 / 2.03 (all p = 1.00). Under the weighted spectrum (`--no-binary-spectrum`, Deng Eq. 3 literal), box/anox still accept (0.500 / 0.600) but ox is rejected everywhere because its weighted NNSD is Wigner-like (β = 0.92 at st = 0.52).]
 
 #figure(
   image("paper/fig_scan_audit.png", width: 88%),
@@ -254,13 +255,14 @@ the raw ox spectrum away from Poisson.
 
 == Robustness of the modules
 
-+ *Scale-free*: Clauset MLE at st = 0.52 gives γ = 2.68 (box, xmin = 6, KS =
-  0.108, p = 1.00), 2.57 (ox, p = 0.99), 2.09 (anox, p = 0.97) — all three
-  degree tails are consistent with a power law. (The old OLS-on-log-bins
++ *Scale-free*: Clauset MLE gives γ = 2.68 (box), 2.57 (ox), 2.09 (anox) at
+  st = 0.52 (all p ≥ 0.97), and 1.86 / 2.22 / 2.03 at the automatic thresholds —
+  all degree tails are consistent with a power law. (The old OLS-on-log-bins
   R² ≈ 0.02–0.06 reading was misleading.)
-+ *Bootstrap*: `--boot 20` at st = 0.52 gives mean module Jaccard 0.398 (box),
-  0.376 (ox), 0.392 (anox) — modules are real but moderately unstable to
-  sample resampling; report them with this number attached.
++ *Bootstrap*: `--boot 20` at the automatic thresholds gives mean module
+  Jaccard 0.346 (box), 0.414 (ox), 0.446 (anox) — modules are real but
+  moderately unstable to sample resampling; report them with this number
+  attached.
 + *Signed edges*: `--signed` on ox at 0.52 finds 7 negative of 836 edges —
   anticorrelated pairs exist but are rare at this threshold.
 
@@ -311,9 +313,10 @@ constraint, and under CLR the weighted ox spectrum also becomes estimable
 silent.
 
 Finally, modularity numbers are only meaningful against a null: with
-degree-preserving rewiring, all three conditions sit 20–37 null SD above the
-random ensemble, and module stability under bootstrap is ~0.38–0.40 mean
-Jaccard — real structure, honestly quantified.
+degree-preserving rewiring, all three conditions sit 20–31 null SD above the
+random ensemble (Q-z), and module stability under bootstrap is 0.35–0.45
+mean Jaccard at the automatic thresholds — real structure, honestly
+quantified.
 
 = Conclusion
 
