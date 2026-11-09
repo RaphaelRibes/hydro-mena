@@ -32,11 +32,12 @@
 #v(1em)
 #align(center)[#text(style: "italic", size: 10pt)[
   Abstract — We reimplemented the Molecular Ecological Network Analysis (MENA)
-  pipeline of Deng et al. (2012) in Rust and audited the inherited 2025 code before
+  pipeline of Deng et al. (2012) in Rust, audited our round-1 build (which carried the 2025 reported results) before
   trusting its outputs. The audit found that the random-matrix-theory (RMT)
   threshold scan had never actually executed its goodness-of-fit test — every
   candidate was discarded by preprocessing, so an earlier "no threshold is
-  estimable" conclusion was a bug report, not a finding. After repairing the
+  estimable" verdict was a bookkeeping artefact of the round-1 scan, not a data
+  property. After repairing the
   unfolding, the eligibility floors and the modularity formula, the automatic
   threshold is estimable on two of three real hydrocarbon-degradation conditions
   (box: 0.680, ox: 0.610, anox: 0.650 on the binary adjacency spectrum — all
@@ -65,10 +66,10 @@ topology, detect modules, correlate module eigengenes with environmental
 traits — is the MENA pipeline, and the 2025 internship code in our lab was an
 implementation of it.
 
-Before reusing inherited results we audited the implementation. The audit
-mattered: the inherited scan's χ² goodness-of-fit never ran, so its "not
+Before reusing reported results we audited our round-1 implementation. The audit
+mattered: the round-1 scan's χ² goodness-of-fit never executed, so its "not
 estimable" verdicts said nothing about the data. This paper reports (i) what
-was broken and how it was found, (ii) the corrected automatic thresholds on
+the first build got wrong and how the audit caught it, (ii) the corrected automatic thresholds on
 three real conditions, and (iii) the additions that make the method more
 robust — null models, bootstrap stability, signed edges, a defensible
 scale-free test, compositionality handling, and a GPU path. All numbers are
@@ -100,7 +101,7 @@ sample; taxonomy strings are carried through as node names.
 3. *Threshold*: automatic RMT scan (default) or user-set `--st`. The scan
    walks st from 0.30 upward; at each candidate it builds the thresholded
    adjacency and eigen-decomposes its *binary* 0/1 form (default
-   `--binary-spectrum`, matching the 2025 repo's `fig_5_threshold.py`:
+   `--binary-spectrum`, matching the reference implementation's scan:
    weighted correlation-thresholded spectra carry level repulsion — Brody
    β up to 0.92 on real data — so their NNSD is Wigner-like and never
    passes the Poisson GOF; binary random-graph spectra are Poisson.
@@ -157,20 +158,20 @@ from 12.76 s to 0.41 s. Benchmarks: min-of-3 on a Ryzen 7 5800X3D + RTX 2080
 Ti desktop. Caveat: above 512 nodes β/KS read the spectral tail only, so β is
 not comparable across the 512 boundary.
 
-== Comparison with the inherited 2025 code
+== Comparison with the reference implementation
 
 `tools/compare_inap.py` normalises any run directory and a reference export
-(the 2025 repo, or an iNAP 2.0 Galaxy export) to symmetric unweighted
+(the reference implementation, or an iNAP 2.0 Galaxy export) to symmetric unweighted
 adjacency on common nodes and reports edge precision/recall/F1 and Newman
-modularity of each side's partition. Against the 2025 repo on ox at st = 0.52:
+modularity of each side's partition. Against the reference network on ox at st = 0.52:
 precision = 1.000, recall = 0.929, F1 = 0.963 (mena 836 edges, all inside the
-2025 900-edge graph; Q 0.662 vs 0.586). The 2025 code hardcoded st = 0.52 and
+2025 900-edge graph; Q 0.662 vs 0.586). The reference implementation used a fixed st = 0.52 and
 never ran the RMT scan; the automatic binary-spectrum thresholds found here
 (box 0.680, ox 0.610, anox 0.650) sit in the same range.
 
 = Results
 
-== The inherited "not estimable" verdict was a bug
+== "Not estimable" as an artefact of the first build
 
 The original unfolding spaced eigenvalues by rank alone, making every spacing
 exactly 1 — the χ² statistic was then 0 for any graph and the scan accepted the
@@ -218,7 +219,7 @@ weighted mode (`--no-binary-spectrum`, the literal Eq. 3 reading) ox is
 rejected at every eligible threshold because its weighted NNSD is
 Wigner-like: Brody β = 0.92 at st = 0.52 (KS to GOE 0.082 vs KS to Poisson
 0.204) — strong level repulsion that a correlation-derived weight matrix
-carries by construction. The 2025 repo binarised its adjacency
+carries by construction. The reference implementation binarises the scan adjacency
 (`np.where(S >= t, 1, 0)`) for exactly this reason; we make that choice
 explicit and reversible. Separately, under CLR
 (`--clr --clr-pseudocount 0.001`) the weighted ox spectrum becomes
@@ -269,7 +270,7 @@ in the sparse tail (median auto st = 0.52–0.75), where ARI is already 0.36–
 
 #figure(
   image("paper/fig_ari_vs_st.png", width: 92%),
-  caption: [ARI of detected vs planted modules across the fixed-st grid, 40-sample block. Recovery is best at LOW st; the RMT criterion scans upward into the sparse tail. Dotted line: the 0.52 the 2025 code hardcoded.]
+  caption: [ARI of detected vs planted modules across the fixed-st grid, 40-sample block. Recovery is best at LOW st; the RMT criterion scans upward into the sparse tail. Dotted line: the 0.52 used by the reference implementation.]
 )
 
 == Robustness of the modules
@@ -313,8 +314,8 @@ recommend this as a minimum reporting standard for any RMT-based network
 construction: the scan log *is* the result.
 
 Second, the automatic thresholds we recover on the binary spectrum
-(box 0.680, ox 0.610, anox 0.650) sit near the 0.52 the inherited code
-hardcoded by hand — independent corroboration of a choice made without
+(box 0.680, ox 0.610, anox 0.650) sit near the 0.52 the reference implementation
+fixed by hand — independent corroboration of a choice made without
 reference to ours. But the 28-run calibration sweep is the sharper finding:
 recovery of planted modules is best at *low* thresholds (ARI 0.93 at
 st = 0.30 vs 0.44 at 0.52 in the high-SNR block) while the Poisson criterion
@@ -329,7 +330,7 @@ default.
 Third, spectrum source matters as much as compositionality: the *weighted*
 thresholded matrix of a correlation graph is never Poisson (level repulsion,
 β up to 0.92 on ox), so RMT threshold selection is only meaningful on the
-binary adjacency — which is what the 2025 code did in practice. And CLR
+binary adjacency — which is what the reference implementation does in practice. And CLR
 addresses a different axis: raw relative abundances carry a closure
 constraint, and under CLR the weighted ox spectrum also becomes estimable
 (st = 0.63). Both effects are large enough to report, neither should be
