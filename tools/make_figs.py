@@ -302,6 +302,43 @@ def fig_bench():
     plt.close(fig)
 
 
+
+
+def fig_ari_vs_st():
+    # Calibration sweep (28 runs, scratch/mena_calib/calibration.json):
+    # ARI of detected vs planted modules across a fixed-st grid.
+    import json as _json
+    p = Path("/home/raphael/.hermes/cache/scratch/mena_calib/calibration.json")
+    if not p.exists():
+        print("no calibration.json — skipping fig_ari_vs_st")
+        return
+    d = _json.load(open(p))
+    rvt = d["recovery_vs_threshold"]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    blocks = {}
+    for r in rvt:
+        # only the informative 40-sample block(s); 12-sample runs are capped by the simulator
+        if r["samples"] != 40:
+            continue
+        key = (r["n"], r["samples"], round(r["noise"], 2))
+        blocks.setdefault(key, []).append(r)
+    styles = [("o-", "#1f77b4"), ("s-", "#d62728"), ("^-", "#2ca02c"), ("d-", "#9467bd")]
+    for (key, rows), (mk, col) in zip(sorted(blocks.items()), styles):
+        rows = sorted(rows, key=lambda x: x["st"])
+        ax.plot([r["st"] for r in rows], [r["mean_ari"] for r in rows], mk,
+                color=col, ms=4, lw=1.2,
+                label=f"n={key[0]} samples={key[1]} noise={key[2]}")
+    ax.axvline(0.52, ls=":", c="k", lw=0.8)
+    ax.annotate("2025 hardcoded st=0.52", xy=(0.52, 0.9), fontsize=7, rotation=90, va="top")
+    ax.set_xlabel("threshold st")
+    ax.set_ylabel("ARI vs planted modules")
+    ax.set_title("Calibration: recovery peaks at LOW st, RMT scan picks higher st")
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_ari_vs_st.png", dpi=150)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     fig_scan_audit()
     fig_spectrum()
@@ -312,4 +349,5 @@ if __name__ == "__main__":
     fig_rmt_compare()
     fig_calibration()
     fig_bench()
+    fig_ari_vs_st()
     print("figures written to", OUT)

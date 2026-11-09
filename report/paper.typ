@@ -255,6 +255,23 @@ the raw ox spectrum away from Poisson.
   caption: [Adjacency spectrum and nearest-neighbour spacings of the ox graph at st = 0.52, against Poisson and Wigner references — the visual counterpart of β = 0.92.]
 )
 
+== Calibration: what threshold actually recovers planted structure?
+
+A 28-run simulation sweep (n = 120/200, 4 planted modules, 12/40 samples,
+noise 0.45–1.4) shows the Poisson criterion and module recovery pull in
+opposite directions: at n = 200, 40 samples, noise 0.45, ARI peaks at
+*st = 0.30 (0.926, Jaccard 0.947)* and decays monotonically to 0.44 at
+st = 0.52 and 0.31 at st = 0.70, while modularity keeps climbing (0.54 →
+0.84) and the module count over-splits (4 planted → 22 at st = 0.70). The
+binary-spectrum auto scan converges 21/28 runs (weighted: 13/28) but lands
+in the sparse tail (median auto st = 0.52–0.75), where ARI is already 0.36–
+0.47 in the high-SNR block. At noise ≥ 0.75 nothing is recoverable at any st.
+
+#figure(
+  image("paper/fig_ari_vs_st.png", width: 92%),
+  caption: [ARI of detected vs planted modules across the fixed-st grid, 40-sample block. Recovery is best at LOW st; the RMT criterion scans upward into the sparse tail. Dotted line: the 0.52 the 2025 code hardcoded.]
+)
+
 == Robustness of the modules
 
 + *Scale-free*: Clauset MLE gives γ = 2.68 (box), 2.57 (ox), 2.09 (anox) at
@@ -298,12 +315,16 @@ construction: the scan log *is* the result.
 Second, the automatic thresholds we recover on the binary spectrum
 (box 0.680, ox 0.610, anox 0.650) sit near the 0.52 the inherited code
 hardcoded by hand — independent corroboration of a choice made without
-reference to ours. But calibration on simulated data
-shows recovery of planted modules is best at *low* thresholds while the
-Poisson criterion scans upward: the criterion optimises spectral randomness,
-not community recovery. We therefore keep the automatic threshold as the
-default and expose `--st` for users who calibrate their own — the trade-off
-is stated, not hidden in a default.
+reference to ours. But the 28-run calibration sweep is the sharper finding:
+recovery of planted modules is best at *low* thresholds (ARI 0.93 at
+st = 0.30 vs 0.44 at 0.52 in the high-SNR block) while the Poisson criterion
+scans upward into the sparse tail (median auto st 0.52–0.75, ARI 0.36–0.47
+there). The criterion optimises spectral randomness, not community recovery —
+and modularity, which keeps rising with st, actively misleads. We therefore
+keep the automatic threshold as the default for *estimability*, expose
+`--st` for users who calibrate their own, and report the ARI-vs-st curve
+alongside every automatic verdict — the trade-off is stated, not hidden in a
+default.
 
 Third, spectrum source matters as much as compositionality: the *weighted*
 thresholded matrix of a correlation graph is never Poisson (level repulsion,

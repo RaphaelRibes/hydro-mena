@@ -235,14 +235,36 @@ anox 0.600) were chosen without reference to it.
 
 == Calibration: which threshold recovers planted structure?
 
-300 OTUs, 24 samples, 5 planted modules, 10 seeds.
+28 simulated runs (n = 120/200, 4 planted modules, 12 or 40 samples, noise
+0.45–1.4, seeds 1–3 per cell), each scanned with the binary spectrum (default)
+and the weighted ablation, plus a 12-point fixed-st grid. Full payload:
+`mena_calib/calibration.json` (scratch).
 
 #figure(
   image("fig_calibration.png", width: 100%),
-  caption: [Recovery falls as the threshold rises, while the RMT criterion scans
-    upward. Right panel: the single-level optimiser over-splits — 5 planted modules
-    become 24 at st = 0.70.]
+  caption: [Left: kept nodes and edge count fall monotonically with st on the
+    three real conditions. Right (from the sweep): ARI of detected vs planted
+    modules at n = 200, 40 samples, noise 0.45 — recovery is best at LOW st
+    (ARI 0.926 at st = 0.30, Jaccard 0.947) and decays as st rises (0.44 at
+    0.52, 0.31 at 0.70), while modularity keeps climbing (0.54 → 0.84) and the
+    module count over-splits (4 planted → 22 at st = 0.70).]
 )
+
+Key numbers from the sweep (2026-11-09):
++ Binary-spectrum auto converges 21/28 runs (weighted: 13/28) — the binary
+  mode is also the more available one on simulated data.
++ But the auto threshold lands in the sparse tail: auto st = 0.65–0.80 at
+  12 samples (median 0.75), 0.50–0.55 at 40 samples (median 0.52). In the
+  high-SNR block (40 samples, noise 0.45) ARI at the auto st is 0.36–0.47 vs
+  0.93 at st = 0.30 — the Poisson criterion selects spectral randomness, not
+  community recovery, and the accepted region sits 1–3 candidates wide right
+  at the giant-fragmentation edge (above it: `excluded_tiny_giant` 6/21,
+  `rejected_gof` 8/21).
++ At noise ≥ 0.75 no threshold recovers signal (ARI ≤ 0.1 everywhere); at 12
+  samples the simulator caps ARI ≈ 0.3, so only the 40-sample block is
+  informative.
++ Aggregate over all 28 runs: mean ARI at auto st 0.082, at st = 0.52 0.105,
+  best fixed st 0.213 — dominated by the unrecoverable high-noise cells.
 
 #table(
   columns: (auto, auto, auto, auto, auto),
